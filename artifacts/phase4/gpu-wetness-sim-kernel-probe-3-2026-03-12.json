@@ -1,0 +1,137 @@
+[
+  {
+    "scene": "A-idle-recovery",
+    "metrics": {
+      "avgFrameMs": 107.49,
+      "engineMs": 107.58,
+      "rendererMs": 1.71,
+      "wetnessMs": 107.51,
+      "wetnessBackend": "gpu-sim-prototype",
+      "overlayMs": 0.06,
+      "overlayBackend": "cpu-2d",
+      "dropletProcessingMs": 0.15,
+      "clearingMs": 0.57,
+      "diffusionMs": 55.22,
+      "imageConvertMs": 26.19,
+      "wetnessTrendMsPerMin": 259.15,
+      "wetnessResolutionLabel": "1382x777",
+      "wetnessResolutionPixels": 1073814,
+      "activeCoveragePct": 96.2
+    },
+    "memory": {
+      "usedJSHeapSize": 86555643,
+      "totalJSHeapSize": 101532799,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\A-idle-recovery.png",
+    "capturedAt": "2026-03-12T17:37:24.207Z"
+  },
+  {
+    "scene": "B-active-rain",
+    "metrics": {
+      "avgFrameMs": 107.56,
+      "engineMs": 107.33,
+      "rendererMs": 1.96,
+      "wetnessMs": 107.24,
+      "wetnessBackend": "gpu-sim-prototype",
+      "overlayMs": 0.08,
+      "overlayBackend": "cpu-2d",
+      "dropletProcessingMs": 0.15,
+      "clearingMs": 0.55,
+      "diffusionMs": 60.11,
+      "imageConvertMs": 24.7,
+      "wetnessTrendMsPerMin": 240.16,
+      "wetnessResolutionLabel": "1382x777",
+      "wetnessResolutionPixels": 1073814,
+      "activeCoveragePct": 95.8
+    },
+    "memory": {
+      "usedJSHeapSize": 45973201,
+      "totalJSHeapSize": 50280833,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\B-active-rain.png",
+    "capturedAt": "2026-03-12T17:37:40.143Z"
+  },
+  {
+    "scene": "C-writing-strokes",
+    "metrics": {
+      "avgFrameMs": 115.28,
+      "engineMs": 114.13,
+      "rendererMs": 1.7,
+      "wetnessMs": 114.06,
+      "wetnessBackend": "gpu-sim-prototype",
+      "overlayMs": 0.07,
+      "overlayBackend": "cpu-2d",
+      "dropletProcessingMs": 0.19,
+      "clearingMs": 0.71,
+      "diffusionMs": 59.7,
+      "imageConvertMs": 28.52,
+      "wetnessTrendMsPerMin": 78.64,
+      "wetnessResolutionLabel": "1382x777",
+      "wetnessResolutionPixels": 1073814,
+      "activeCoveragePct": 98.7
+    },
+    "memory": {
+      "usedJSHeapSize": 94431736,
+      "totalJSHeapSize": 122951696,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\C-writing-strokes.png",
+    "capturedAt": "2026-03-12T17:38:23.817Z"
+  },
+  {
+    "scene": "D-split-compare",
+    "metrics": {
+      "avgFrameMs": 113.65,
+      "engineMs": 113.52,
+      "rendererMs": 1.54,
+      "wetnessMs": 113.44,
+      "wetnessBackend": "gpu-sim-prototype",
+      "overlayMs": 0.08,
+      "overlayBackend": "cpu-2d",
+      "dropletProcessingMs": 0.11,
+      "clearingMs": 0.45,
+      "diffusionMs": 61.66,
+      "imageConvertMs": 26.73,
+      "wetnessTrendMsPerMin": 371.72,
+      "wetnessResolutionLabel": "1382x777",
+      "wetnessResolutionPixels": 1073814,
+      "activeCoveragePct": 96.5
+    },
+    "memory": {
+      "usedJSHeapSize": 84291729,
+      "totalJSHeapSize": 93585853,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\D-split-compare.png",
+    "capturedAt": "2026-03-12T17:38:41.236Z"
+  },
+  {
+    "scene": "E-ultrawide-stress",
+    "metrics": {
+      "avgFrameMs": 204.74,
+      "engineMs": 208.07,
+      "rendererMs": 1.65,
+      "wetnessMs": 207.97,
+      "wetnessBackend": "gpu-sim-prototype",
+      "overlayMs": 0.11,
+      "overlayBackend": "cpu-2d",
+      "dropletProcessingMs": 0.1,
+      "clearingMs": 0.29,
+      "diffusionMs": 131.04,
+      "imageConvertMs": 58.64,
+      "wetnessTrendMsPerMin": 747.12,
+      "wetnessResolutionLabel": "2476x1036",
+      "wetnessResolutionPixels": 2565136,
+      "activeCoveragePct": 99.4
+    },
+    "memory": {
+      "usedJSHeapSize": 97490344,
+      "totalJSHeapSize": 113502744,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\E-ultrawide-stress.png",
+    "capturedAt": "2026-03-12T17:39:01.010Z"
+  }
+]

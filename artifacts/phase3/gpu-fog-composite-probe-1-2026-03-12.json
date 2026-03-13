@@ -1,0 +1,132 @@
+[
+  {
+    "scene": "A-idle-recovery",
+    "metrics": {
+      "avgFrameMs": 121.63,
+      "engineMs": 121.24,
+      "rendererMs": 1.53,
+      "wetnessMs": 121.11,
+      "overlayMs": 0.13,
+      "overlayBackend": "gpu-fog-composite",
+      "dropletProcessingMs": 0.09,
+      "clearingMs": 0.37,
+      "diffusionMs": 81.59,
+      "imageConvertMs": 24.08,
+      "wetnessTrendMsPerMin": 173.08,
+      "wetnessResolutionLabel": "1382x777",
+      "wetnessResolutionPixels": 1073814,
+      "activeCoveragePct": 95.8
+    },
+    "memory": {
+      "usedJSHeapSize": 83387079,
+      "totalJSHeapSize": 101377103,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\A-idle-recovery.png",
+    "capturedAt": "2026-03-12T16:58:21.188Z"
+  },
+  {
+    "scene": "B-active-rain",
+    "metrics": {
+      "avgFrameMs": 116.36,
+      "engineMs": 115.96,
+      "rendererMs": 1.56,
+      "wetnessMs": 115.84,
+      "overlayMs": 0.12,
+      "overlayBackend": "gpu-fog-composite",
+      "dropletProcessingMs": 0.12,
+      "clearingMs": 0.48,
+      "diffusionMs": 72.1,
+      "imageConvertMs": 23.97,
+      "wetnessTrendMsPerMin": 124.04,
+      "wetnessResolutionLabel": "1382x777",
+      "wetnessResolutionPixels": 1073814,
+      "activeCoveragePct": 98.7
+    },
+    "memory": {
+      "usedJSHeapSize": 93750507,
+      "totalJSHeapSize": 122648339,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\B-active-rain.png",
+    "capturedAt": "2026-03-12T16:58:37.925Z"
+  },
+  {
+    "scene": "C-writing-strokes",
+    "metrics": {
+      "avgFrameMs": 155.65,
+      "engineMs": 154.46,
+      "rendererMs": 1.82,
+      "wetnessMs": 154.35,
+      "overlayMs": 0.11,
+      "overlayBackend": "gpu-fog-composite",
+      "dropletProcessingMs": 0.23,
+      "clearingMs": 0.57,
+      "diffusionMs": 104.74,
+      "imageConvertMs": 24.92,
+      "wetnessTrendMsPerMin": 173.08,
+      "wetnessResolutionLabel": "1382x777",
+      "wetnessResolutionPixels": 1073814,
+      "activeCoveragePct": 99.6
+    },
+    "memory": {
+      "usedJSHeapSize": 89873377,
+      "totalJSHeapSize": 122986013,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\C-writing-strokes.png",
+    "capturedAt": "2026-03-12T16:59:31.772Z"
+  },
+  {
+    "scene": "D-split-compare",
+    "metrics": {
+      "avgFrameMs": 141.14,
+      "engineMs": 141.03,
+      "rendererMs": 1.47,
+      "wetnessMs": 140.88,
+      "overlayMs": 0.15,
+      "overlayBackend": "gpu-fog-composite",
+      "dropletProcessingMs": 0.06,
+      "clearingMs": 0.43,
+      "diffusionMs": 99.61,
+      "imageConvertMs": 23.29,
+      "wetnessTrendMsPerMin": 304.95,
+      "wetnessResolutionLabel": "1382x777",
+      "wetnessResolutionPixels": 1073814,
+      "activeCoveragePct": 96.9
+    },
+    "memory": {
+      "usedJSHeapSize": 101051944,
+      "totalJSHeapSize": 153342076,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\D-split-compare.png",
+    "capturedAt": "2026-03-12T16:59:50.433Z"
+  },
+  {
+    "scene": "E-ultrawide-stress",
+    "metrics": {
+      "avgFrameMs": 242.39,
+      "engineMs": 244.19,
+      "rendererMs": 1.51,
+      "wetnessMs": 244.02,
+      "overlayMs": 0.17,
+      "overlayBackend": "gpu-fog-composite",
+      "dropletProcessingMs": 0.03,
+      "clearingMs": 0.27,
+      "diffusionMs": 176.39,
+      "imageConvertMs": 53.98,
+      "wetnessTrendMsPerMin": 59.62,
+      "wetnessResolutionLabel": "2476x1036",
+      "wetnessResolutionPixels": 2565136,
+      "activeCoveragePct": 92.4
+    },
+    "memory": {
+      "usedJSHeapSize": 94715282,
+      "totalJSHeapSize": 99135962,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\E-ultrawide-stress.png",
+    "capturedAt": "2026-03-12T17:00:10.883Z"
+  }
+]

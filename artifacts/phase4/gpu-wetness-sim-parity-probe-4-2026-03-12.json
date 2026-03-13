@@ -1,0 +1,162 @@
+[
+  {
+    "scene": "A-idle-recovery",
+    "metrics": {
+      "avgFrameMs": 115.21,
+      "engineMs": 115.04,
+      "rendererMs": 1.72,
+      "wetnessMs": 114.99,
+      "wetnessBackend": "gpu-sim-prototype",
+      "gpuSimKernel": "diffuse-v1",
+      "gpuSimReadbackMs": 1.75,
+      "cpuFogAlphaMean": 0.46833,
+      "gpuFogAlphaMean": 0.46833,
+      "gpuCpuAlphaDelta": 0,
+      "overlayMs": 0.06,
+      "overlayBackend": "cpu-2d",
+      "dropletProcessingMs": 0.11,
+      "clearingMs": 0.47,
+      "diffusionMs": 62.52,
+      "imageConvertMs": 26.41,
+      "wetnessTrendMsPerMin": 183.89,
+      "wetnessResolutionLabel": "1382x777",
+      "wetnessResolutionPixels": 1073814,
+      "activeCoveragePct": 96.6
+    },
+    "memory": {
+      "usedJSHeapSize": 94893053,
+      "totalJSHeapSize": 107893201,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\A-idle-recovery.png",
+    "capturedAt": "2026-03-12T17:41:23.123Z"
+  },
+  {
+    "scene": "B-active-rain",
+    "metrics": {
+      "avgFrameMs": 106.14,
+      "engineMs": 105.93,
+      "rendererMs": 1.53,
+      "wetnessMs": 105.88,
+      "wetnessBackend": "gpu-sim-prototype",
+      "gpuSimKernel": "diffuse-v1",
+      "gpuSimReadbackMs": 1.717,
+      "cpuFogAlphaMean": 0.47639,
+      "gpuFogAlphaMean": 0.47639,
+      "gpuCpuAlphaDelta": 0,
+      "overlayMs": 0.05,
+      "overlayBackend": "cpu-2d",
+      "dropletProcessingMs": 0.17,
+      "clearingMs": 0.52,
+      "diffusionMs": 56.72,
+      "imageConvertMs": 25.82,
+      "wetnessTrendMsPerMin": 217.33,
+      "wetnessResolutionLabel": "1382x777",
+      "wetnessResolutionPixels": 1073814,
+      "activeCoveragePct": 98.7
+    },
+    "memory": {
+      "usedJSHeapSize": 52543094,
+      "totalJSHeapSize": 85715898,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\B-active-rain.png",
+    "capturedAt": "2026-03-12T17:41:38.893Z"
+  },
+  {
+    "scene": "C-writing-strokes",
+    "metrics": {
+      "avgFrameMs": 119.2,
+      "engineMs": 117.46,
+      "rendererMs": 1.66,
+      "wetnessMs": 117.37,
+      "wetnessBackend": "gpu-sim-prototype",
+      "gpuSimKernel": "diffuse-v1",
+      "gpuSimReadbackMs": 1.465,
+      "cpuFogAlphaMean": 0.80116,
+      "gpuFogAlphaMean": 0.80116,
+      "gpuCpuAlphaDelta": 0,
+      "overlayMs": 0.09,
+      "overlayBackend": "cpu-2d",
+      "dropletProcessingMs": 0.22,
+      "clearingMs": 0.59,
+      "diffusionMs": 65.83,
+      "imageConvertMs": 27.38,
+      "wetnessTrendMsPerMin": 72.22,
+      "wetnessResolutionLabel": "1382x777",
+      "wetnessResolutionPixels": 1073814,
+      "activeCoveragePct": 99
+    },
+    "memory": {
+      "usedJSHeapSize": 70589967,
+      "totalJSHeapSize": 91247039,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\C-writing-strokes.png",
+    "capturedAt": "2026-03-12T17:42:24.292Z"
+  },
+  {
+    "scene": "D-split-compare",
+    "metrics": {
+      "avgFrameMs": 109.87,
+      "engineMs": 110.48,
+      "rendererMs": 1.66,
+      "wetnessMs": 110.41,
+      "wetnessBackend": "gpu-sim-prototype",
+      "gpuSimKernel": "diffuse-v1",
+      "gpuSimReadbackMs": 1.533,
+      "cpuFogAlphaMean": 0.47589,
+      "gpuFogAlphaMean": 0.47589,
+      "gpuCpuAlphaDelta": 0,
+      "overlayMs": 0.07,
+      "overlayBackend": "cpu-2d",
+      "dropletProcessingMs": 0.14,
+      "clearingMs": 0.47,
+      "diffusionMs": 60.68,
+      "imageConvertMs": 26.48,
+      "wetnessTrendMsPerMin": 163.46,
+      "wetnessResolutionLabel": "1382x777",
+      "wetnessResolutionPixels": 1073814,
+      "activeCoveragePct": 99.6
+    },
+    "memory": {
+      "usedJSHeapSize": 157193901,
+      "totalJSHeapSize": 205226357,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\D-split-compare.png",
+    "capturedAt": "2026-03-12T17:42:41.607Z"
+  },
+  {
+    "scene": "E-ultrawide-stress",
+    "metrics": {
+      "avgFrameMs": 207.31,
+      "engineMs": 209.59,
+      "rendererMs": 1.86,
+      "wetnessMs": 209.52,
+      "wetnessBackend": "gpu-sim-prototype",
+      "gpuSimKernel": "diffuse-v1",
+      "gpuSimReadbackMs": 4.192,
+      "cpuFogAlphaMean": 0.39577,
+      "gpuFogAlphaMean": 0.39577,
+      "gpuCpuAlphaDelta": 0,
+      "overlayMs": 0.07,
+      "overlayBackend": "cpu-2d",
+      "dropletProcessingMs": 0.05,
+      "clearingMs": 0.37,
+      "diffusionMs": 137.38,
+      "imageConvertMs": 57.14,
+      "wetnessTrendMsPerMin": 1064.42,
+      "wetnessResolutionLabel": "2476x1036",
+      "wetnessResolutionPixels": 2565136,
+      "activeCoveragePct": 96.8
+    },
+    "memory": {
+      "usedJSHeapSize": 103858742,
+      "totalJSHeapSize": 108930526,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\E-ultrawide-stress.png",
+    "capturedAt": "2026-03-12T17:43:01.295Z"
+  }
+]

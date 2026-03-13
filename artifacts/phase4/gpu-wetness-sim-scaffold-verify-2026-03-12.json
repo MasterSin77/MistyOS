@@ -1,0 +1,137 @@
+[
+  {
+    "scene": "A-idle-recovery",
+    "metrics": {
+      "avgFrameMs": 104.31,
+      "engineMs": 104.88,
+      "rendererMs": 1.61,
+      "wetnessMs": 104.71,
+      "wetnessBackend": "gpu-sim-prototype",
+      "overlayMs": 0.16,
+      "overlayBackend": "cpu-gpu-compare",
+      "dropletProcessingMs": 0.13,
+      "clearingMs": 0.51,
+      "diffusionMs": 66.72,
+      "imageConvertMs": 23.6,
+      "wetnessTrendMsPerMin": 297.32,
+      "wetnessResolutionLabel": "1382x777",
+      "wetnessResolutionPixels": 1073814,
+      "activeCoveragePct": 95.8
+    },
+    "memory": {
+      "usedJSHeapSize": 90405585,
+      "totalJSHeapSize": 101578145,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\A-idle-recovery.png",
+    "capturedAt": "2026-03-12T17:12:48.419Z"
+  },
+  {
+    "scene": "B-active-rain",
+    "metrics": {
+      "avgFrameMs": 115.55,
+      "engineMs": 114.58,
+      "rendererMs": 1.51,
+      "wetnessMs": 114.45,
+      "wetnessBackend": "gpu-sim-prototype",
+      "overlayMs": 0.13,
+      "overlayBackend": "cpu-gpu-compare",
+      "dropletProcessingMs": 0.14,
+      "clearingMs": 0.43,
+      "diffusionMs": 76.92,
+      "imageConvertMs": 24.05,
+      "wetnessTrendMsPerMin": 366.8,
+      "wetnessResolutionLabel": "1382x777",
+      "wetnessResolutionPixels": 1073814,
+      "activeCoveragePct": 95.9
+    },
+    "memory": {
+      "usedJSHeapSize": 57781006,
+      "totalJSHeapSize": 83435218,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\B-active-rain.png",
+    "capturedAt": "2026-03-12T17:13:04.685Z"
+  },
+  {
+    "scene": "C-writing-strokes",
+    "metrics": {
+      "avgFrameMs": 125.46,
+      "engineMs": 124.16,
+      "rendererMs": 1.68,
+      "wetnessMs": 124.01,
+      "wetnessBackend": "gpu-sim-prototype",
+      "overlayMs": 0.13,
+      "overlayBackend": "cpu-gpu-compare",
+      "dropletProcessingMs": 0.21,
+      "clearingMs": 0.58,
+      "diffusionMs": 79.81,
+      "imageConvertMs": 25.08,
+      "wetnessTrendMsPerMin": 81.41,
+      "wetnessResolutionLabel": "1382x777",
+      "wetnessResolutionPixels": 1073814,
+      "activeCoveragePct": 98.7
+    },
+    "memory": {
+      "usedJSHeapSize": 113412699,
+      "totalJSHeapSize": 157121979,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\C-writing-strokes.png",
+    "capturedAt": "2026-03-12T17:13:50.802Z"
+  },
+  {
+    "scene": "D-split-compare",
+    "metrics": {
+      "avgFrameMs": 111.82,
+      "engineMs": 112.03,
+      "rendererMs": 1.6,
+      "wetnessMs": 111.87,
+      "wetnessBackend": "gpu-sim-prototype",
+      "overlayMs": 0.16,
+      "overlayBackend": "cpu-gpu-compare",
+      "dropletProcessingMs": 0.11,
+      "clearingMs": 0.4,
+      "diffusionMs": 71.58,
+      "imageConvertMs": 24.78,
+      "wetnessTrendMsPerMin": 250.64,
+      "wetnessResolutionLabel": "1382x777",
+      "wetnessResolutionPixels": 1073814,
+      "activeCoveragePct": 98
+    },
+    "memory": {
+      "usedJSHeapSize": 128000198,
+      "totalJSHeapSize": 191093446,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\D-split-compare.png",
+    "capturedAt": "2026-03-12T17:14:08.730Z"
+  },
+  {
+    "scene": "E-ultrawide-stress",
+    "metrics": {
+      "avgFrameMs": 200,
+      "engineMs": 200.57,
+      "rendererMs": 1.77,
+      "wetnessMs": 200.39,
+      "wetnessBackend": "gpu-sim-prototype",
+      "overlayMs": 0.17,
+      "overlayBackend": "cpu-gpu-compare",
+      "dropletProcessingMs": 0.08,
+      "clearingMs": 0.28,
+      "diffusionMs": 130.99,
+      "imageConvertMs": 54.43,
+      "wetnessTrendMsPerMin": 486.06,
+      "wetnessResolutionLabel": "2476x1036",
+      "wetnessResolutionPixels": 2565136,
+      "activeCoveragePct": 97.8
+    },
+    "memory": {
+      "usedJSHeapSize": 95103831,
+      "totalJSHeapSize": 98384475,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\E-ultrawide-stress.png",
+    "capturedAt": "2026-03-12T17:14:28.070Z"
+  }
+]

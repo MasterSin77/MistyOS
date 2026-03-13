@@ -1,0 +1,132 @@
+[
+  {
+    "scene": "A-idle-recovery",
+    "metrics": {
+      "avgFrameMs": 139.47,
+      "engineMs": 138.71,
+      "rendererMs": 1.5,
+      "wetnessMs": 138.48,
+      "overlayMs": 0.22,
+      "overlayBackend": "cpu-gpu-compare",
+      "dropletProcessingMs": 0.16,
+      "clearingMs": 0.39,
+      "diffusionMs": 96.42,
+      "imageConvertMs": 24.92,
+      "wetnessTrendMsPerMin": 401.37,
+      "wetnessResolutionLabel": "1382x777",
+      "wetnessResolutionPixels": 1073814,
+      "activeCoveragePct": 97.6
+    },
+    "memory": {
+      "usedJSHeapSize": 87360840,
+      "totalJSHeapSize": 100541028,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\A-idle-recovery.png",
+    "capturedAt": "2026-03-12T16:52:34.629Z"
+  },
+  {
+    "scene": "B-active-rain",
+    "metrics": {
+      "avgFrameMs": 146.27,
+      "engineMs": 146.92,
+      "rendererMs": 2,
+      "wetnessMs": 146.74,
+      "overlayMs": 0.18,
+      "overlayBackend": "cpu-gpu-compare",
+      "dropletProcessingMs": 0.1,
+      "clearingMs": 0.49,
+      "diffusionMs": 105.9,
+      "imageConvertMs": 23.51,
+      "wetnessTrendMsPerMin": 382.42,
+      "wetnessResolutionLabel": "1382x777",
+      "wetnessResolutionPixels": 1073814,
+      "activeCoveragePct": 97.4
+    },
+    "memory": {
+      "usedJSHeapSize": 46194762,
+      "totalJSHeapSize": 51009390,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\B-active-rain.png",
+    "capturedAt": "2026-03-12T16:52:51.540Z"
+  },
+  {
+    "scene": "C-writing-strokes",
+    "metrics": {
+      "avgFrameMs": 164.79,
+      "engineMs": 164.28,
+      "rendererMs": 1.95,
+      "wetnessMs": 164.16,
+      "overlayMs": 0.12,
+      "overlayBackend": "cpu-gpu-compare",
+      "dropletProcessingMs": 0.18,
+      "clearingMs": 0.62,
+      "diffusionMs": 112.68,
+      "imageConvertMs": 25.83,
+      "wetnessTrendMsPerMin": 86.08,
+      "wetnessResolutionLabel": "1382x777",
+      "wetnessResolutionPixels": 1073814,
+      "activeCoveragePct": 98.8
+    },
+    "memory": {
+      "usedJSHeapSize": 57961569,
+      "totalJSHeapSize": 84750073,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\C-writing-strokes.png",
+    "capturedAt": "2026-03-12T16:53:48.128Z"
+  },
+  {
+    "scene": "D-split-compare",
+    "metrics": {
+      "avgFrameMs": 148.89,
+      "engineMs": 148.74,
+      "rendererMs": 1.43,
+      "wetnessMs": 148.61,
+      "overlayMs": 0.12,
+      "overlayBackend": "cpu-gpu-compare",
+      "dropletProcessingMs": 0.12,
+      "clearingMs": 0.41,
+      "diffusionMs": 109.2,
+      "imageConvertMs": 23.24,
+      "wetnessTrendMsPerMin": 366.35,
+      "wetnessResolutionLabel": "1382x777",
+      "wetnessResolutionPixels": 1073814,
+      "activeCoveragePct": 94.1
+    },
+    "memory": {
+      "usedJSHeapSize": 47096533,
+      "totalJSHeapSize": 53562389,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\D-split-compare.png",
+    "capturedAt": "2026-03-12T16:54:06.849Z"
+  },
+  {
+    "scene": "E-ultrawide-stress",
+    "metrics": {
+      "avgFrameMs": 272.57,
+      "engineMs": 283.9,
+      "rendererMs": 1.59,
+      "wetnessMs": 283.73,
+      "overlayMs": 0.17,
+      "overlayBackend": "cpu-gpu-compare",
+      "dropletProcessingMs": 0.05,
+      "clearingMs": 0.2,
+      "diffusionMs": 210.73,
+      "imageConvertMs": 59.33,
+      "wetnessTrendMsPerMin": 1086.54,
+      "wetnessResolutionLabel": "2476x1036",
+      "wetnessResolutionPixels": 2565136,
+      "activeCoveragePct": 94.1
+    },
+    "memory": {
+      "usedJSHeapSize": 101059383,
+      "totalJSHeapSize": 111489787,
+      "jsHeapSizeLimit": 4294967296
+    },
+    "screenshot": "C:\\Users\\cerul\\Rain\\mistyos-poc\\artifacts\\phase0\\E-ultrawide-stress.png",
+    "capturedAt": "2026-03-12T16:54:28.856Z"
+  }
+]
