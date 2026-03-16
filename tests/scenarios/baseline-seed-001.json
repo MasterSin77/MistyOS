@@ -1,0 +1,18 @@
+{
+  "id": "baseline-seed-001",
+  "description": "Initial seeded harness scenario for baseline approval and M1 tracking.",
+  "seed": 1337,
+  "fixedDeltaMs": 16.6667,
+  "totalFrames": 600,
+  "resolution": {
+    "width": 1920,
+    "height": 1080
+  },
+  "background": {
+    "style": "solid",
+    "color": "#0f1a2b"
+  },
+  "rain": {
+    "ratePerSecond": 2
+  }
+}
