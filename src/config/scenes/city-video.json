@@ -1,0 +1,13 @@
+{
+  "id": "city-video",
+  "name": "City Window Video",
+  "background": {
+    "type": "video",
+    "src": "/media/rain-room.mp4",
+    "loop": true,
+    "muted": true,
+    "autoplay": true
+  },
+  "timelineId": "default-atmosphere",
+  "presetId": "core-wet-surface"
+}

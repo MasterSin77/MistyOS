@@ -1,0 +1,69 @@
+{
+  "id": "runner-carve-diagnosis",
+  "name": "Runner Carve Diagnosis",
+  "loop": true,
+  "duration": {
+    "seconds": 70
+  },
+  "weatherTracks": [
+    {
+      "kind": "fogBuildup",
+      "region": "global",
+      "envelope": [
+        { "timeSec": 0, "value": 0.72 },
+        { "timeSec": 8, "value": 0.94 },
+        { "timeSec": 24, "value": 0.97 },
+        { "timeSec": 56, "value": 0.96 },
+        { "timeSec": 70, "value": 0.9 }
+      ]
+    },
+    {
+      "kind": "fogClearing",
+      "region": "global",
+      "envelope": [
+        { "timeSec": 0, "value": 0.0 },
+        { "timeSec": 42, "value": 0.01 },
+        { "timeSec": 70, "value": 0.02 }
+      ]
+    },
+    {
+      "kind": "rain",
+      "region": "global",
+      "envelope": [
+        { "timeSec": 0, "value": 0.01 },
+        { "timeSec": 16, "value": 0.03 },
+        { "timeSec": 22, "value": 0.18 },
+        { "timeSec": 28, "value": 0.72 },
+        { "timeSec": 38, "value": 0.9 },
+        { "timeSec": 56, "value": 0.86 },
+        { "timeSec": 64, "value": 0.28 },
+        { "timeSec": 70, "value": 0.08 }
+      ]
+    },
+    {
+      "kind": "mist",
+      "region": "global",
+      "envelope": [
+        { "timeSec": 0, "value": 0.04 },
+        { "timeSec": 70, "value": 0.06 }
+      ]
+    },
+    {
+      "kind": "wind",
+      "region": "global",
+      "envelope": [
+        { "timeSec": 0, "value": 0.02 },
+        { "timeSec": 70, "value": 0.04 }
+      ]
+    },
+    {
+      "kind": "washdown",
+      "region": "global",
+      "envelope": [
+        { "timeSec": 0, "value": 0 },
+        { "timeSec": 70, "value": 0 }
+      ]
+    }
+  ],
+  "intentEvents": []
+}

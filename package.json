@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "verify:phase1-rain": "node tools/scripts/verify-publish-rain-fog-integrity.mjs",
+    "verify:phase46": "node tools/scripts/verify-phase46-verification-productization.mjs",
+    "verify:phase47": "node tools/scripts/verify-phase47-trustless-verification-report-export.mjs"
   },
   "dependencies": {
     "rain": "file:..",
@@ -14,7 +17,7 @@
     "react-dom": "^19.2.0"
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "^5.1.1",
+    "@vitejs/plugin-react": "^5.2.0",
     "playwright": "^1.58.2",
     "vite": "^7.1.9"
   }

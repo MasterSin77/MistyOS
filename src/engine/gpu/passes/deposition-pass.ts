@@ -22,8 +22,12 @@ export class DepositionPass {
       entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: "unfilterable-float" } },
         { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: "write-only", format: "r32float" } },
-        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
-        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } }
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: "unfilterable-float" } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: "write-only", format: "rg32float" } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: "unfilterable-float" } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: "write-only", format: "r32float" } },
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+        { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } }
       ]
     });
 
@@ -55,8 +59,12 @@ struct Uniforms {
 
 @group(0) @binding(0) var wetnessIn: texture_2d<f32>;
 @group(0) @binding(1) var wetnessOut: texture_storage_2d<r32float, write>;
-@group(0) @binding(2) var<uniform> uniforms: Uniforms;
-@group(0) @binding(3) var<storage, read> droplets: array<vec4<f32>>;
+@group(0) @binding(2) var flowIn: texture_2d<f32>;
+@group(0) @binding(3) var flowOut: texture_storage_2d<rg32float, write>;
+@group(0) @binding(4) var disturbanceIn: texture_2d<f32>;
+@group(0) @binding(5) var disturbanceOut: texture_storage_2d<r32float, write>;
+@group(0) @binding(6) var<uniform> uniforms: Uniforms;
+@group(0) @binding(7) var<storage, read> droplets: array<vec4<f32>>;
 
 fn hash(v: u32) -> u32 {
   var x = v;
@@ -74,6 +82,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 
   let prior = textureLoad(wetnessIn, vec2<i32>(gid.xy), 0).r;
+  let priorFlow = textureLoad(flowIn, vec2<i32>(gid.xy), 0).xy;
+  let priorDisturbance = textureLoad(disturbanceIn, vec2<i32>(gid.xy), 0).r;
   let rate = bitcast<f32>(uniforms.rainRateBits);
   let deltaMs = bitcast<f32>(uniforms.deltaMsBits);
   let chanceScale = bitcast<f32>(uniforms.chanceScaleBits);
@@ -82,6 +92,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let dropletDepositionRate = bitcast<f32>(uniforms.dropletDepositionRateBits);
   let deltaSec = max(0.0, deltaMs * 0.001);
   let yNorm = f32(gid.y) / max(1.0, f32(size.y - 1u));
+  let xNorm = f32(gid.x) / max(1.0, f32(size.x - 1u));
   let maxX = i32(size.x) - 1;
   let maxY = i32(size.y) - 1;
   let px = i32(gid.x);
@@ -110,7 +121,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let local = vec2<f32>(f32(gid.x % cellSize) - centerX, f32(gid.y % cellSize) - centerY);
   let kernel = max(0.0, 1.0 - abs(local.x) * 0.34 - abs(local.y) * 0.14);
   let clusterChance = clamp(depositChance * 1.18, 0.00008, 0.0090);
-  let clusterInjected = select(0.0, depositAmount * (0.40 + kernel * 0.70), cellRnd < clusterChance && kernel > 0.0);
+  // Slow-moving rain bands keep structure temporally coherent over short frame windows.
+  let bandFrame = uniforms.frame / 9u;
+  let bandHash = hash((gid.y / 7u) * 92821u + bandFrame * 19777u + uniforms.seed * 1237u);
+  let meanderHash = hash((gid.y / 5u) * 50177u + (uniforms.frame / 5u) * 3571u + uniforms.seed * 811u);
+  let bandCenter = f32((bandHash >> 5u) & 255u) / 255.0;
+  let bandWidth = 0.10 + f32((bandHash >> 13u) & 31u) / 255.0;
+  let bandDist = abs(xNorm - bandCenter);
+  let bandWeight = max(0.0, 1.0 - bandDist / max(0.04, bandWidth));
+  let clusterInjected = select(0.0, depositAmount * (0.36 + kernel * 0.62 + bandWeight * 0.26), cellRnd < clusterChance && kernel > 0.0);
 
   // Light sparse deposition keeps background dampness secondary to localized starts.
   let sparseInjected = select(0.0, depositAmount * 0.10, rnd < depositChance * 0.08);
@@ -138,20 +157,47 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let trailWidth = radius * 0.20;
     let trail = inTrail * max(0.0, 1.0 - tailDx / max(0.0001, trailWidth)) * max(0.0, 1.0 - tailDy / max(0.0001, trailLen));
 
-    dropletInjected += (core * 0.70 + trail * 1.32) * mass * dropletDepositionRate;
+    dropletInjected += (core * 0.34 + trail * 0.86) * mass * dropletDepositionRate;
   }
 
   // Preserve a living mid-regime: gently support dry areas while shedding overly wet regions.
   let dryBoost = 1.0 + (1.0 - smoothstep(0.02, 0.12, prior)) * 0.60;
   let saturationGate = clamp(1.0 - smoothstep(0.22, 0.54, prior), 0.20, 1.0);
   let saturationBleed = max(0.0, prior - 0.58) * 0.016;
+  let localMean = (prior + up + down + left + right) * 0.2;
+  let lockIn = smoothstep(0.10, 0.34, prior + localMean * 0.55);
+  let preLock = 1.0 - lockIn;
   let verticalChannel = max(0.0, up - prior) + max(0.0, prior - down) * 0.6;
-  let channelFollow = smoothstep(0.004, 0.060, verticalChannel);
+  let channelFollow = smoothstep(0.004, 0.060, verticalChannel) * (0.26 + lockIn * 0.74);
+  let downPath = smoothstep(0.02, 0.30, down + prior * 0.25);
+  let verticalBridge = smoothstep(0.02, 0.22, min(up, down));
+  let widthHash = hash(gid.x * 31337u + gid.y * 6971u + uniforms.seed * 1901u);
+  let widthVar = 0.88 + f32((widthHash >> 7u) & 63u) / 210.0;
   let lateralSpread = abs(left - right);
-  let lateralSuppress = 1.0 - smoothstep(0.02, 0.12, lateralSpread) * 0.30;
-  let injected = (clusterInjected + sparseInjected + drySeedInjected + dropletInjected * (1.0 + channelFollow * 0.55)) * lateralSuppress;
+  let lateralSuppress = 1.0 - smoothstep(0.02, 0.12, lateralSpread) * (0.12 + lockIn * 0.12);
+  let disturbanceLatch = smoothstep(0.02, 0.35, priorDisturbance);
+  let inputCoherence = 1.0 + bandWeight * 0.26 + disturbanceLatch * 0.10 + verticalBridge * 0.12 + preLock * 0.10;
+  let filmInjected = clusterInjected * (1.06 + preLock * 0.22) + sparseInjected * (1.40 + preLock * 0.35) + drySeedInjected * (1.00 + preLock * 0.18);
+  let dropletContribution = dropletInjected * (0.82 + channelFollow * (0.24 + 0.08 * widthVar) + downPath * 0.10 + verticalBridge * 0.08);
+  let nodeContrast = max(0.0, prior - localMean);
+  let antiNodeImprint = 1.0 - smoothstep(0.015, 0.090, nodeContrast) * (0.10 + lockIn * 0.12);
+  let injected = (filmInjected + dropletContribution) * lateralSuppress * inputCoherence * antiNodeImprint;
+  let impactSignal = clamp(injected * 220.0, 0.0, 1.0);
+  let jitterX = (rnd - 0.5) * 0.018;
+  let driftSign = select(-1.0, 1.0, f32((bandHash >> 3u) & 1u) > 0.5);
+  let meander = (f32(meanderHash & 255u) / 255.0 - 0.5) * 0.0036;
+  let rainDriftX = driftSign * bandWeight * (0.005 + preLock * 0.0015) + meander * (1.0 - downPath * 0.45);
+  let downImpulse = impactSignal * (0.009 + yNorm * (0.018 + lockIn * 0.006) + bandWeight * 0.004 + downPath * (0.003 + lockIn * 0.003));
+  let flowImpulse = vec2<f32>(jitterX * (0.26 + impactSignal * (1.0 - downPath * 0.35)) + rainDriftX * (1.0 - downPath * 0.20), downImpulse);
+  let nextFlow = clamp(priorFlow * 0.985 + flowImpulse, vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0));
+
+  let disturbanceInjected = impactSignal * (0.38 + bandWeight * 0.24 + clamp(dropletInjected * 180.0, 0.0, 0.58));
+  let nextDisturbance = clamp(max(priorDisturbance * 0.92, disturbanceInjected), 0.0, 1.0);
+
   let nextWetness = clamp(prior + injected * dryBoost * saturationGate - saturationBleed, 0.0, 1.0);
   textureStore(wetnessOut, vec2<i32>(gid.xy), vec4<f32>(nextWetness, 0.0, 0.0, 1.0));
+  textureStore(flowOut, vec2<i32>(gid.xy), vec4<f32>(nextFlow, 0.0, 1.0));
+  textureStore(disturbanceOut, vec2<i32>(gid.xy), vec4<f32>(nextDisturbance, 0.0, 0.0, 1.0));
 }
 `
         }),
@@ -182,8 +228,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       entries: [
         { binding: 0, resource: state.currentReadView() },
         { binding: 1, resource: state.currentWriteView() },
-        { binding: 2, resource: { buffer: this.uniformBuffer } },
-        { binding: 3, resource: { buffer: dropletBuffer } }
+        { binding: 2, resource: state.currentFlowReadView() },
+        { binding: 3, resource: state.currentFlowWriteView() },
+        { binding: 4, resource: state.currentDisturbanceReadView() },
+        { binding: 5, resource: state.currentDisturbanceWriteView() },
+        { binding: 6, resource: { buffer: this.uniformBuffer } },
+        { binding: 7, resource: { buffer: dropletBuffer } }
       ]
     });
 

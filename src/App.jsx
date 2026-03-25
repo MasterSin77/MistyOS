@@ -793,6 +793,16 @@ function App() {
               <p className="line">Engine ms: {(timingStats.engineMs || 0).toFixed(2)}</p>
               <p className="line">Renderer ms: {(timingStats.rendererMs || 0).toFixed(2)}</p>
               <p className="line">Wetness ms: {(timingStats.wetnessMs || 0).toFixed(2)}</p>
+              <p className="line">Renderer sampling source: {timingStats.rendererSamplingSource || 'fog-canvas-alpha-compat'}</p>
+              <p className="line">Renderer wetness mean: {(timingStats.rendererWetnessSampleMean || 0).toFixed(5)}</p>
+              <p className="line">Renderer wetness var: {(timingStats.rendererWetnessSampleVariance || 0).toFixed(6)}</p>
+              <p className="line">Renderer trail mean: {(timingStats.rendererTrailSampleMean || 0).toFixed(5)}</p>
+              <p className="line">Renderer runner mean: {(timingStats.rendererRunnerSampleMean || 0).toFixed(5)}</p>
+              <p className="line">Debug wetness peak: {(timingStats.debugWetnessPeak || 0).toFixed(5)}</p>
+              <p className="line">Debug trail peak: {(timingStats.debugTrailPeak || 0).toFixed(5)}</p>
+              <p className="line">Debug runner peak: {(timingStats.debugRunnerPeak || 0).toFixed(5)}</p>
+              <p className="line">Renderer channel coverage: {(((timingStats.rendererChannelCoverage || 0) * 100)).toFixed(2)}%</p>
+              <p className="line">Renderer carve coverage: {(((timingStats.rendererCarveCoverage || 0) * 100)).toFixed(2)}%</p>
               <p className="line">Wetness backend: {timingStats.wetnessBackend || 'cpu-grid'}</p>
               <p className="line">Interaction backend: {timingStats.interactionBackend || 'cpu-direct'}</p>
               <p className="line">Compatibility mode: {timingStats.compatibilityMode || 'cpu-compat'}</p>

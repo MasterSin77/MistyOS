@@ -1,4 +1,5 @@
 export type HarnessMode = "realtime" | "deterministic";
+export type RenderMode = "comparison" | "debug-wetness" | "debug-flow" | "debug-disturbance";
 
 export interface ScenarioTuning {
   depositionChanceScale: number;
@@ -45,6 +46,23 @@ export interface FrameStats {
   simulationMs: number;
   renderMs: number;
   frameMs: number;
+  timingCheckpoint?: {
+    depositionMs: number;
+    decayMs: number;
+    renderMs: number;
+    totalFrameMs: number;
+    smoothedTotalFrameMs: number;
+    smoothedDepositionMs: number;
+    smoothedDecayMs: number;
+    smoothedRenderMs: number;
+    totalFrameP95Ms: number;
+    totalFrameMinMs: number;
+    totalFrameMaxMs: number;
+    stabilitySpreadMs: number;
+    dominantPass: "deposition" | "decay" | "render";
+    dominantShare: number;
+    sampleCount: number;
+  };
   simulationClock?: {
     simulatedTimeMs: number;
     wallTimeMs: number;
@@ -54,7 +72,7 @@ export interface FrameStats {
   };
   motionSanityError?: string;
   comparisonReadiness?: {
-    renderMode: "comparison" | "debug-wetness";
+    renderMode: RenderMode;
     backgroundApplied: boolean;
     backgroundMeanLuma: number;
   };
@@ -65,6 +83,11 @@ export interface FrameStats {
     variance: number;
     activeRatio: number;
     temporalDelta: number;
+    flowMeanMagnitude: number;
+    flowTemporalDelta: number;
+    disturbanceMean: number;
+    disturbanceActiveRatio: number;
+    disturbanceTemporalDelta: number;
     sampleIntervalFrames: number;
     classification: "dry" | "low-motion" | "structured-motion";
   };
@@ -83,7 +106,7 @@ export interface EngineInterface {
   collectStats(context: EngineFrameContext): FrameStats;
   captureStateHash?(): Promise<string>;
   setBackgroundDataUrl?(dataUrl: string): Promise<void>;
-  setRenderMode?(mode: "comparison" | "debug-wetness"): void;
+  setRenderMode?(mode: RenderMode): void;
 }
 
 export interface HarnessController {

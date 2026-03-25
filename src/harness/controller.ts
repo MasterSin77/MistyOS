@@ -1,5 +1,5 @@
 import { createCandidateEngine } from "../engine/runtime/candidate-engine";
-import type { FrameStats, HarnessController, HarnessMode, ScenarioManifest } from "../engine/types";
+import type { FrameStats, HarnessController, HarnessMode, RenderMode, ScenarioManifest } from "../engine/types";
 import { createComparisonReport } from "../analysis/comparison-report";
 import {
   assertReferenceApproved,
@@ -111,7 +111,8 @@ export async function createHarnessController(options: HarnessControllerOptions)
   const captureBridge = createCaptureBridge(initialScenario);
   const engine = await createCandidateEngine(initialScenario.resolution.width, initialScenario.resolution.height, initialScenario.seed);
   let comparisonPreset: PresetName = "night-boulevard";
-  let renderMode: "comparison" | "debug-wetness" = "comparison";
+  const renderModes: RenderMode[] = ["comparison", "debug-wetness", "debug-flow", "debug-disturbance"];
+  let renderMode: RenderMode = "comparison";
 
   await engine.setBackgroundDataUrl?.(createPresetDataUrl(comparisonPreset));
   engine.setRenderMode?.(renderMode);
@@ -146,7 +147,7 @@ export async function createHarnessController(options: HarnessControllerOptions)
   const updateStatus = (): void => {
     status.textContent = `Mode: ${mode} | Scenario: ${initialScenario.id} | Fixed dt: ${initialScenario.fixedDeltaMs.toFixed(4)} ms | Baseline approved: ${baselineApproved ? "yes" : "no"} | View: ${renderMode} | Background: preset ${comparisonPreset}`;
     modeButton.textContent = mode === "realtime" ? "Switch to deterministic" : "Switch to realtime";
-    renderModeButton.textContent = renderMode === "comparison" ? "Switch to debug wetness" : "Switch to comparison view";
+    renderModeButton.textContent = `Switch view (current: ${renderMode})`;
 
     const readiness = latestStats?.comparisonReadiness;
     const simClock = latestStats?.simulationClock;
@@ -157,7 +158,11 @@ export async function createHarnessController(options: HarnessControllerOptions)
     const simWallMs = simClock?.wallTimeMs ?? 0;
     const simTimeMs = simClock?.simulatedTimeMs ?? 0;
     const simThrottled = simClock?.throttled ?? false;
-    comparisonHealth.textContent = `comparison | renderMode=${activeRenderMode} | backgroundPreset=${comparisonPreset} | backgroundApplied=${backgroundApplied} | backgroundMeanLuma=${backgroundMeanLuma.toFixed(3)} | simWallRatio=${simWallRatio.toFixed(3)} | simWallMs=${simWallMs.toFixed(1)} | simTimeMs=${simTimeMs.toFixed(1)} | simThrottled=${simThrottled} | stageDisplay=1280x720 | canvasPixels=${initialScenario.resolution.width}x${initialScenario.resolution.height} | baselineApprovalGate=${baselineApproved}`;
+    const timing = latestStats?.timingCheckpoint;
+    const timingLine = timing
+      ? ` | frameMs=${timing.totalFrameMs.toFixed(2)} | depMs=${timing.depositionMs.toFixed(2)} | decayMs=${timing.decayMs.toFixed(2)} | renderMs=${timing.renderMs.toFixed(2)} | p95Ms=${timing.totalFrameP95Ms.toFixed(2)} | spreadMs=${timing.stabilitySpreadMs.toFixed(2)} | dominant=${timing.dominantPass}(${(timing.dominantShare * 100).toFixed(1)}%)`
+      : "";
+    comparisonHealth.textContent = `comparison | renderMode=${activeRenderMode} | backgroundPreset=${comparisonPreset} | backgroundApplied=${backgroundApplied} | backgroundMeanLuma=${backgroundMeanLuma.toFixed(3)} | simWallRatio=${simWallRatio.toFixed(3)} | simWallMs=${simWallMs.toFixed(1)} | simTimeMs=${simTimeMs.toFixed(1)} | simThrottled=${simThrottled} | stageDisplay=1280x720 | canvasPixels=${initialScenario.resolution.width}x${initialScenario.resolution.height} | baselineApprovalGate=${baselineApproved}${timingLine}`;
   };
 
   const updateMotionHealth = (): void => {
@@ -177,6 +182,7 @@ export async function createHarnessController(options: HarnessControllerOptions)
     }
 
     const motion = latestStats.motionSanity;
+    const timing = latestStats.timingCheckpoint;
     const simClock = latestStats.simulationClock;
     const warning = motion.classification === "structured-motion"
       ? "none"
@@ -195,6 +201,15 @@ export async function createHarnessController(options: HarnessControllerOptions)
       `variance: ${motion.variance.toExponential(3)}`,
       `activeRatio: ${(motion.activeRatio * 100).toFixed(2)}%`,
       `temporalDelta: ${motion.temporalDelta.toExponential(3)}`,
+      `flowMeanMagnitude: ${motion.flowMeanMagnitude.toExponential(3)}`,
+      `flowTemporalDelta: ${motion.flowTemporalDelta.toExponential(3)}`,
+      `disturbanceMean: ${motion.disturbanceMean.toExponential(3)}`,
+      `disturbanceActiveRatio: ${(motion.disturbanceActiveRatio * 100).toFixed(2)}%`,
+      `disturbanceTemporalDelta: ${motion.disturbanceTemporalDelta.toExponential(3)}`,
+      `timing(frame/dep/decay/render): ${timing ? `${timing.totalFrameMs.toFixed(2)} / ${timing.depositionMs.toFixed(2)} / ${timing.decayMs.toFixed(2)} / ${timing.renderMs.toFixed(2)} ms` : "n/a"}`,
+      `timing(smoothed frame): ${timing ? `${timing.smoothedTotalFrameMs.toFixed(2)} ms` : "n/a"}`,
+      `timing(p95/min/max/spread): ${timing ? `${timing.totalFrameP95Ms.toFixed(2)} / ${timing.totalFrameMinMs.toFixed(2)} / ${timing.totalFrameMaxMs.toFixed(2)} / ${timing.stabilitySpreadMs.toFixed(2)} ms` : "n/a"}`,
+      `timing(dominant): ${timing ? `${timing.dominantPass} (${(timing.dominantShare * 100).toFixed(1)}%)` : "n/a"}`,
       `sampledTexels: ${motion.sampledTexels} every ${motion.sampleIntervalFrames} frames`
     ].join("\n");
   };
@@ -263,7 +278,8 @@ export async function createHarnessController(options: HarnessControllerOptions)
   });
 
   renderModeButton.addEventListener("click", () => {
-    renderMode = renderMode === "comparison" ? "debug-wetness" : "comparison";
+    const nextIndex = (renderModes.indexOf(renderMode) + 1) % renderModes.length;
+    renderMode = renderModes[nextIndex] ?? "comparison";
     engine.setRenderMode?.(renderMode);
     updateStatus();
   });

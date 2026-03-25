@@ -1,0 +1,103 @@
+{
+  "id": "default-atmosphere",
+  "name": "Default Atmosphere",
+  "loop": true,
+  "duration": {
+    "seconds": 180
+  },
+  "weatherTracks": [
+    {
+      "kind": "fogBuildup",
+      "region": "global",
+      "envelope": [
+        { "timeSec": 0, "value": 0.25 },
+        { "timeSec": 60, "value": 0.68 },
+        { "timeSec": 120, "value": 0.55 },
+        { "timeSec": 180, "value": 0.25 }
+      ]
+    },
+    {
+      "kind": "fogClearing",
+      "region": "global",
+      "envelope": [
+        { "timeSec": 0, "value": 0.05 },
+        { "timeSec": 70, "value": 0.12 },
+        { "timeSec": 105, "value": 0.45 },
+        { "timeSec": 155, "value": 0.2 },
+        { "timeSec": 180, "value": 0.05 }
+      ]
+    },
+    {
+      "kind": "mist",
+      "region": "global",
+      "envelope": [
+        { "timeSec": 0, "value": 0.35 },
+        { "timeSec": 180, "value": 0.4 }
+      ]
+    },
+    {
+      "kind": "rain",
+      "region": "global",
+      "envelope": [
+        { "timeSec": 0, "value": 0.18 },
+        { "timeSec": 45, "value": 0.32 },
+        { "timeSec": 95, "value": 0.54 },
+        { "timeSec": 130, "value": 0.75 },
+        { "timeSec": 180, "value": 0.22 }
+      ]
+    },
+    {
+      "kind": "wind",
+      "region": "q1",
+      "envelope": [
+        { "timeSec": 0, "value": 0.1 },
+        { "timeSec": 40, "value": 0.2 },
+        { "timeSec": 90, "value": 0.35 },
+        { "timeSec": 140, "value": 0.22 },
+        { "timeSec": 180, "value": 0.1 }
+      ]
+    },
+    {
+      "kind": "washdown",
+      "region": "q3",
+      "envelope": [
+        { "timeSec": 0, "value": 0.08 },
+        { "timeSec": 100, "value": 0.15 },
+        { "timeSec": 145, "value": 0.45 },
+        { "timeSec": 180, "value": 0.08 }
+      ]
+    }
+  ],
+  "intentEvents": [
+    {
+      "id": "clock-reveal-1",
+      "kind": "clock-reveal",
+      "startSec": 22,
+      "durationSec": 34,
+      "region": "q1",
+      "payload": {
+        "text": "10:24"
+      }
+    },
+    {
+      "id": "message-draw-1",
+      "kind": "message-draw",
+      "startSec": 84,
+      "durationSec": 38,
+      "region": "q2",
+      "payload": {
+        "text": "MistyOS"
+      }
+    },
+    {
+      "id": "social-icon-reveal-1",
+      "kind": "social-icon-reveal",
+      "startSec": 132,
+      "durationSec": 26,
+      "region": "q4",
+      "payload": {
+        "icon": "dot"
+      }
+    }
+  ]
+}

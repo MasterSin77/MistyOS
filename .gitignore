@@ -5,3 +5,6 @@ dist/
 !.vscode/settings.json
 coverage/
 *.log
+archive/
+tools/logs/
+*.tsbuildinfo

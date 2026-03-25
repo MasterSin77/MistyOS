@@ -1,0 +1,10 @@
+{
+  "id": "street-gif",
+  "name": "Street Neon Loop",
+  "background": {
+    "type": "gif",
+    "src": "/media/rain-room.jpg"
+  },
+  "timelineId": "default-atmosphere",
+  "presetId": "core-wet-surface"
+}

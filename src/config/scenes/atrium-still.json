@@ -1,0 +1,10 @@
+{
+  "id": "atrium-still",
+  "name": "Atrium Still",
+  "background": {
+    "type": "image",
+    "src": "/media/rain-room.jpg"
+  },
+  "timelineId": "default-atmosphere",
+  "presetId": "core-wet-surface"
+}

@@ -1,0 +1,20 @@
+{
+  "id": "core-wet-surface",
+  "name": "Core Wet Surface",
+  "tuning": {
+    "surfaceWetness": {
+      "initialWetness": 0.1,
+      "refillRate": 0.0048
+    },
+    "fogSurface": {
+      "baseFogLevel": 0.02,
+      "fogAlphaMultiplier": 0.45,
+      "fogFillBoost": 0.01
+    },
+    "renderer": {
+      "mistEnabled": true,
+      "mistColorA": 0.04,
+      "dropletsPerSeconds": 240
+    }
+  }
+}

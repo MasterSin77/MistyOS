@@ -2,7 +2,7 @@ import { DecayPass } from "../gpu/passes/decay-pass";
 import { DepositionPass } from "../gpu/passes/deposition-pass";
 import { WetnessRenderPass } from "../gpu/passes/wetness-render-pass";
 import { createSharedSurfaceState } from "../gpu/state/shared-surface";
-import type { EngineFrameContext, EngineInterface, FrameStats } from "../types";
+import type { EngineFrameContext, EngineInterface, FrameStats, RenderMode } from "../types";
 import { createPresetDataUrl } from "../../reference/background-presets";
 
 const SAMPLE_WIDTH = 64;
@@ -10,10 +10,13 @@ const SAMPLE_HEIGHT = 16;
 const SAMPLE_TEXELS = SAMPLE_WIDTH * SAMPLE_HEIGHT;
 const SAMPLE_BYTES_PER_ROW = 256;
 const SAMPLE_BUFFER_SIZE = SAMPLE_BYTES_PER_ROW * SAMPLE_HEIGHT;
+const FLOW_COMPONENTS_PER_PIXEL = 2;
 const MOTION_SAMPLE_INTERVAL_FRAMES = 12;
 const MAX_DROPLETS = 48;
 const DROPLET_STRIDE = 4;
 const DROPLET_BUFFER_SIZE = MAX_DROPLETS * DROPLET_STRIDE * Float32Array.BYTES_PER_ELEMENT;
+const TIMING_EMA_ALPHA = 0.12;
+const TIMING_WINDOW_SIZE = 120;
 
 interface DropletState {
   x: number;
@@ -54,6 +57,7 @@ export async function createCandidateEngine(width: number, height: number, seed:
   });
 
   const state = createSharedSurfaceState(device, width, height);
+  initializeCanonicalSurfaceState(device, state, width, height);
   const depositionPass = new DepositionPass(device);
   const decayPass = new DecayPass(device);
   const renderPass = new WetnessRenderPass(device, surfaceFormat, width, height);
@@ -75,6 +79,22 @@ export async function createCandidateEngine(width: number, height: number, seed:
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
   });
 
+  const flowMotionSampleBytesPerRow = alignTo(width * Float32Array.BYTES_PER_ELEMENT * FLOW_COMPONENTS_PER_PIXEL, 256);
+  const flowMotionReadBufferSize = flowMotionSampleBytesPerRow * height;
+  const flowMotionReadBuffer = device.createBuffer({
+    label: "flow-state-motion-readback",
+    size: flowMotionReadBufferSize,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+  });
+
+  const disturbanceMotionSampleBytesPerRow = alignTo(width * Float32Array.BYTES_PER_ELEMENT, 256);
+  const disturbanceMotionReadBufferSize = disturbanceMotionSampleBytesPerRow * height;
+  const disturbanceMotionReadBuffer = device.createBuffer({
+    label: "disturbance-state-motion-readback",
+    size: disturbanceMotionReadBufferSize,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+  });
+
   const dropletStateBuffer = device.createBuffer({
     label: "droplet-state-buffer",
     size: DROPLET_BUFFER_SIZE,
@@ -89,11 +109,18 @@ export async function createCandidateEngine(width: number, height: number, seed:
 
   let motionSamplePending = false;
   let lastMotionSampleFrame = -MOTION_SAMPLE_INTERVAL_FRAMES;
-  let previousMotionSample: Float32Array | null = null;
+  let previousWetnessSample: Float32Array | null = null;
+  let previousFlowSample: Float32Array | null = null;
+  let previousDisturbanceSample: Float32Array | null = null;
   let motionSampleTicket = 0;
-  let renderMode: "comparison" | "debug-wetness" = "comparison";
+  let renderMode: RenderMode = "comparison";
   let backgroundApplied = true;
   let backgroundMeanLuma = computeMeanLumaFromImage(initialBackground, width, height);
+  let smoothedDepositionMs = 0;
+  let smoothedDecayMs = 0;
+  let smoothedRenderMs = 0;
+  let smoothedTotalFrameMs = 0;
+  const totalFrameWindow = new RollingWindow(TIMING_WINDOW_SIZE);
 
   const applyCanvasBackground = (dataUrl: string): void => {
     canvas.style.backgroundImage = `url("${dataUrl}")`;
@@ -141,6 +168,7 @@ export async function createCandidateEngine(width: number, height: number, seed:
       writeDropletBuffer(dropletUpload, droplets, width, height);
       device.queue.writeBuffer(dropletStateBuffer, 0, dropletUpload.buffer, dropletUpload.byteOffset, dropletUpload.byteLength);
 
+      const depositionStart = performance.now();
       depositionPass.run(encoder, state, dropletStateBuffer, {
         frame: frameContext.frame,
         seed,
@@ -152,20 +180,45 @@ export async function createCandidateEngine(width: number, height: number, seed:
         dropletCount: activeDroplets,
         dropletDepositionRate: Math.max(0.2, tuning?.dropletDepositionRate ?? 1) * 0.021
       });
+      const depositionMs = performance.now() - depositionStart;
+
+      const decayStart = performance.now();
       decayPass.run(encoder, state, {
         deltaMs: frameContext.deltaMs,
         decayScale: Math.max(0.2, tuning?.decayRateScale ?? 1),
         runoffScale: Math.max(0.2, tuning?.runoffScale ?? 1),
         retentionScale: Math.max(0.2, tuning?.retentionScale ?? 1)
       });
+      const decayMs = performance.now() - decayStart;
       device.queue.submit([encoder.finish()]);
 
       scheduleMotionSample(frameContext.frame);
 
+      const simulationMs = performance.now() - start;
+      smoothedDepositionMs = nextEma(smoothedDepositionMs, depositionMs, TIMING_EMA_ALPHA);
+      smoothedDecayMs = nextEma(smoothedDecayMs, decayMs, TIMING_EMA_ALPHA);
+
       lastStats = {
         ...lastStats,
         frame: frameContext.frame,
-        simulationMs: performance.now() - start
+        simulationMs,
+        timingCheckpoint: {
+          depositionMs,
+          decayMs,
+          renderMs: lastStats.timingCheckpoint?.renderMs ?? 0,
+          totalFrameMs: simulationMs + (lastStats.timingCheckpoint?.renderMs ?? 0),
+          smoothedTotalFrameMs,
+          smoothedDepositionMs,
+          smoothedDecayMs,
+          smoothedRenderMs,
+          totalFrameP95Ms: totalFrameWindow.p95(),
+          totalFrameMinMs: totalFrameWindow.min(),
+          totalFrameMaxMs: totalFrameWindow.max(),
+          stabilitySpreadMs: totalFrameWindow.spread(),
+          dominantPass: dominantPassFromTimings(depositionMs, decayMs, lastStats.timingCheckpoint?.renderMs ?? 0),
+          dominantShare: dominantShareFromTimings(depositionMs, decayMs, lastStats.timingCheckpoint?.renderMs ?? 0),
+          sampleCount: totalFrameWindow.count()
+        }
       };
     },
     render(frameContext: EngineFrameContext): void {
@@ -176,9 +229,36 @@ export async function createCandidateEngine(width: number, height: number, seed:
       renderPass.run(encoder, state, context.getCurrentTexture().createView());
       device.queue.submit([encoder.finish()]);
 
+      const renderMs = performance.now() - start;
+      smoothedRenderMs = nextEma(smoothedRenderMs, renderMs, TIMING_EMA_ALPHA);
+      const totalFrameMs = (lastStats.timingCheckpoint?.depositionMs ?? 0) + (lastStats.timingCheckpoint?.decayMs ?? 0) + renderMs;
+      totalFrameWindow.push(totalFrameMs);
+      smoothedTotalFrameMs = nextEma(smoothedTotalFrameMs, totalFrameMs, TIMING_EMA_ALPHA);
+      const depositionMs = lastStats.timingCheckpoint?.depositionMs ?? 0;
+      const decayMs = lastStats.timingCheckpoint?.decayMs ?? 0;
+      const dominantPass = dominantPassFromTimings(depositionMs, decayMs, renderMs);
+      const dominantShare = dominantShareFromTimings(depositionMs, decayMs, renderMs);
+
       lastStats = {
         ...lastStats,
-        renderMs: performance.now() - start
+        renderMs,
+        timingCheckpoint: {
+          depositionMs,
+          decayMs,
+          renderMs,
+          totalFrameMs,
+          smoothedTotalFrameMs,
+          smoothedDepositionMs,
+          smoothedDecayMs,
+          smoothedRenderMs,
+          totalFrameP95Ms: totalFrameWindow.p95(),
+          totalFrameMinMs: totalFrameWindow.min(),
+          totalFrameMaxMs: totalFrameWindow.max(),
+          stabilitySpreadMs: totalFrameWindow.spread(),
+          dominantPass,
+          dominantShare,
+          sampleCount: totalFrameWindow.count()
+        }
       };
     },
     collectStats(frameContext: EngineFrameContext): FrameStats {
@@ -188,6 +268,7 @@ export async function createCandidateEngine(width: number, height: number, seed:
         simulationMs: lastStats.simulationMs,
         renderMs: lastStats.renderMs,
         frameMs,
+        timingCheckpoint: lastStats.timingCheckpoint,
         motionSanity: lastStats.motionSanity,
         motionSanityError: lastStats.motionSanityError,
         comparisonReadiness: {
@@ -204,7 +285,7 @@ export async function createCandidateEngine(width: number, height: number, seed:
       renderPass.setBackgroundImage(image);
       applyCanvasBackground(dataUrl);
     },
-    setRenderMode(mode: "comparison" | "debug-wetness"): void {
+    setRenderMode(mode: RenderMode): void {
       renderMode = mode;
       renderPass.setRenderMode(mode);
     },
@@ -265,19 +346,94 @@ export async function createCandidateEngine(width: number, height: number, seed:
         depthOrArrayLayers: 1
       }
     );
+    encoder.copyTextureToBuffer(
+      {
+        texture: state.flowRead,
+        origin: { x: 0, y: 0, z: 0 }
+      },
+      {
+        buffer: flowMotionReadBuffer,
+        bytesPerRow: flowMotionSampleBytesPerRow,
+        rowsPerImage: height
+      },
+      {
+        width,
+        height,
+        depthOrArrayLayers: 1
+      }
+    );
+    encoder.copyTextureToBuffer(
+      {
+        texture: state.disturbanceRead,
+        origin: { x: 0, y: 0, z: 0 }
+      },
+      {
+        buffer: disturbanceMotionReadBuffer,
+        bytesPerRow: disturbanceMotionSampleBytesPerRow,
+        rowsPerImage: height
+      },
+      {
+        width,
+        height,
+        depthOrArrayLayers: 1
+      }
+    );
     device.queue.submit([encoder.finish()]);
 
     const ticket = ++motionSampleTicket;
     void device.queue.onSubmittedWorkDone()
-      .then(() => motionReadBuffer.mapAsync(GPUMapMode.READ))
+      .then(() => Promise.all([
+        motionReadBuffer.mapAsync(GPUMapMode.READ),
+        flowMotionReadBuffer.mapAsync(GPUMapMode.READ),
+        disturbanceMotionReadBuffer.mapAsync(GPUMapMode.READ)
+      ]))
       .then(() => {
-        const mapped = motionReadBuffer.getMappedRange();
-        const values = new Float32Array(mapped);
-        const sample = downsampleWetness(values, width, height, motionSampleBytesPerRow / Float32Array.BYTES_PER_ELEMENT);
-        motionReadBuffer.unmap();
+        const wetnessMapped = motionReadBuffer.getMappedRange();
+        const wetnessValues = new Float32Array(wetnessMapped);
+        const wetnessSample = downsampleScalarField(
+          wetnessValues,
+          width,
+          height,
+          motionSampleBytesPerRow / Float32Array.BYTES_PER_ELEMENT,
+          0,
+          1
+        );
 
-        const nextMotionStats = computeMotionStats(sample, previousMotionSample);
-        previousMotionSample = sample;
+        const flowMapped = flowMotionReadBuffer.getMappedRange();
+        const flowValues = new Float32Array(flowMapped);
+        const flowSample = downsampleFlowField(
+          flowValues,
+          width,
+          height,
+          flowMotionSampleBytesPerRow / Float32Array.BYTES_PER_ELEMENT
+        );
+
+        const disturbanceMapped = disturbanceMotionReadBuffer.getMappedRange();
+        const disturbanceValues = new Float32Array(disturbanceMapped);
+        const disturbanceSample = downsampleScalarField(
+          disturbanceValues,
+          width,
+          height,
+          disturbanceMotionSampleBytesPerRow / Float32Array.BYTES_PER_ELEMENT,
+          0,
+          1
+        );
+
+        motionReadBuffer.unmap();
+        flowMotionReadBuffer.unmap();
+        disturbanceMotionReadBuffer.unmap();
+
+        const nextMotionStats = computeCanonicalMotionStats(
+          wetnessSample,
+          previousWetnessSample,
+          flowSample,
+          previousFlowSample,
+          disturbanceSample,
+          previousDisturbanceSample
+        );
+        previousWetnessSample = wetnessSample;
+        previousFlowSample = flowSample;
+        previousDisturbanceSample = disturbanceSample;
 
         lastStats = {
           ...lastStats,
@@ -289,6 +445,11 @@ export async function createCandidateEngine(width: number, height: number, seed:
             variance: nextMotionStats.variance,
             activeRatio: nextMotionStats.activeRatio,
             temporalDelta: nextMotionStats.temporalDelta,
+            flowMeanMagnitude: nextMotionStats.flowMeanMagnitude,
+            flowTemporalDelta: nextMotionStats.flowTemporalDelta,
+            disturbanceMean: nextMotionStats.disturbanceMean,
+            disturbanceActiveRatio: nextMotionStats.disturbanceActiveRatio,
+            disturbanceTemporalDelta: nextMotionStats.disturbanceTemporalDelta,
             sampleIntervalFrames: MOTION_SAMPLE_INTERVAL_FRAMES,
             classification: nextMotionStats.classification
           }
@@ -460,6 +621,44 @@ export async function createCandidateEngine(width: number, height: number, seed:
   }
 }
 
+function initializeCanonicalSurfaceState(
+  device: GPUDevice,
+  state: ReturnType<typeof createSharedSurfaceState>,
+  width: number,
+  height: number
+): void {
+  clearFloatTexture(device, state.wetnessRead, width, height, 1);
+  clearFloatTexture(device, state.wetnessWrite, width, height, 1);
+  clearFloatTexture(device, state.flowRead, width, height, 2);
+  clearFloatTexture(device, state.flowWrite, width, height, 2);
+  clearFloatTexture(device, state.disturbanceRead, width, height, 1);
+  clearFloatTexture(device, state.disturbanceWrite, width, height, 1);
+}
+
+function clearFloatTexture(
+  device: GPUDevice,
+  texture: GPUTexture,
+  width: number,
+  height: number,
+  componentsPerPixel: number
+): void {
+  const bytesPerRow = width * Float32Array.BYTES_PER_ELEMENT * componentsPerPixel;
+  const data = new Uint8Array(bytesPerRow * height);
+  device.queue.writeTexture(
+    { texture },
+    data,
+    {
+      bytesPerRow,
+      rowsPerImage: height
+    },
+    {
+      width,
+      height,
+      depthOrArrayLayers: 1
+    }
+  );
+}
+
 function clampInt(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value | 0));
 }
@@ -506,19 +705,31 @@ function toErrorMessage(error: unknown): string {
   return String(error);
 }
 
-function computeMotionStats(sample: Float32Array, previous: Float32Array | null): {
+function computeCanonicalMotionStats(
+  wetnessSample: Float32Array,
+  previousWetness: Float32Array | null,
+  flowSample: Float32Array,
+  previousFlow: Float32Array | null,
+  disturbanceSample: Float32Array,
+  previousDisturbance: Float32Array | null
+): {
   meanWetness: number;
   variance: number;
   activeRatio: number;
   temporalDelta: number;
+  flowMeanMagnitude: number;
+  flowTemporalDelta: number;
+  disturbanceMean: number;
+  disturbanceActiveRatio: number;
+  disturbanceTemporalDelta: number;
   classification: "dry" | "low-motion" | "structured-motion";
 } {
   let sum = 0;
   let sumSq = 0;
   let activeCount = 0;
 
-  for (let i = 0; i < sample.length; i += 1) {
-    const value = sample[i] ?? 0;
+  for (let i = 0; i < wetnessSample.length; i += 1) {
+    const value = wetnessSample[i] ?? 0;
     sum += value;
     sumSq += value * value;
     if (value > 0.002) {
@@ -526,23 +737,67 @@ function computeMotionStats(sample: Float32Array, previous: Float32Array | null)
     }
   }
 
-  const count = sample.length;
+  const count = wetnessSample.length;
   const meanWetness = count > 0 ? sum / count : 0;
   const variance = count > 0 ? Math.max(0, sumSq / count - meanWetness * meanWetness) : 0;
   const activeRatio = count > 0 ? activeCount / count : 0;
 
   let temporalDelta = 0;
-  if (previous && previous.length === sample.length) {
-    for (let i = 0; i < sample.length; i += 1) {
-      temporalDelta += Math.abs((sample[i] ?? 0) - (previous[i] ?? 0));
+  if (previousWetness && previousWetness.length === wetnessSample.length) {
+    for (let i = 0; i < wetnessSample.length; i += 1) {
+      temporalDelta += Math.abs((wetnessSample[i] ?? 0) - (previousWetness[i] ?? 0));
     }
     temporalDelta /= count;
   }
 
+  let flowMagnitudeSum = 0;
+  for (let i = 0; i < flowSample.length; i += 2) {
+    const fx = flowSample[i] ?? 0;
+    const fy = flowSample[i + 1] ?? 0;
+    flowMagnitudeSum += Math.hypot(fx, fy);
+  }
+  const flowSampleCount = flowSample.length / 2;
+  const flowMeanMagnitude = flowSampleCount > 0 ? flowMagnitudeSum / flowSampleCount : 0;
+
+  let flowTemporalDelta = 0;
+  if (previousFlow && previousFlow.length === flowSample.length) {
+    for (let i = 0; i < flowSample.length; i += 2) {
+      const fx = flowSample[i] ?? 0;
+      const fy = flowSample[i + 1] ?? 0;
+      const pfx = previousFlow[i] ?? 0;
+      const pfy = previousFlow[i + 1] ?? 0;
+      flowTemporalDelta += Math.hypot(fx - pfx, fy - pfy);
+    }
+    flowTemporalDelta /= Math.max(1, flowSampleCount);
+  }
+
+  let disturbanceSum = 0;
+  let disturbanceActiveCount = 0;
+  for (let i = 0; i < disturbanceSample.length; i += 1) {
+    const value = disturbanceSample[i] ?? 0;
+    disturbanceSum += value;
+    if (value > 0.02) {
+      disturbanceActiveCount += 1;
+    }
+  }
+  const disturbanceMean = disturbanceSample.length > 0 ? disturbanceSum / disturbanceSample.length : 0;
+  const disturbanceActiveRatio = disturbanceSample.length > 0 ? disturbanceActiveCount / disturbanceSample.length : 0;
+
+  let disturbanceTemporalDelta = 0;
+  if (previousDisturbance && previousDisturbance.length === disturbanceSample.length) {
+    for (let i = 0; i < disturbanceSample.length; i += 1) {
+      disturbanceTemporalDelta += Math.abs((disturbanceSample[i] ?? 0) - (previousDisturbance[i] ?? 0));
+    }
+    disturbanceTemporalDelta /= Math.max(1, disturbanceSample.length);
+  }
+
   let classification: "dry" | "low-motion" | "structured-motion" = "structured-motion";
-  if (activeRatio < 0.002 && meanWetness < 0.005) {
+  if (activeRatio < 0.002 && meanWetness < 0.005 && disturbanceMean < 0.01 && flowMeanMagnitude < 0.005) {
     classification = "dry";
-  } else if (temporalDelta < 0.0012 || variance < 0.00002) {
+  } else if (
+    (temporalDelta < 0.0012 && flowTemporalDelta < 0.001 && disturbanceTemporalDelta < 0.0012) ||
+    (variance < 0.00002 && flowMeanMagnitude < 0.01 && disturbanceActiveRatio < 0.005)
+  ) {
     classification = "low-motion";
   }
 
@@ -551,6 +806,11 @@ function computeMotionStats(sample: Float32Array, previous: Float32Array | null)
     variance,
     activeRatio,
     temporalDelta,
+    flowMeanMagnitude,
+    flowTemporalDelta,
+    disturbanceMean,
+    disturbanceActiveRatio,
+    disturbanceTemporalDelta,
     classification
   };
 }
@@ -604,11 +864,89 @@ function alignTo(value: number, alignment: number): number {
   return Math.ceil(value / alignment) * alignment;
 }
 
-function downsampleWetness(
+function nextEma(previous: number, next: number, alpha: number): number {
+  if (previous <= 0) {
+    return next;
+  }
+  return previous * (1 - alpha) + next * alpha;
+}
+
+function dominantPassFromTimings(
+  depositionMs: number,
+  decayMs: number,
+  renderMs: number
+): "deposition" | "decay" | "render" {
+  if (depositionMs >= decayMs && depositionMs >= renderMs) {
+    return "deposition";
+  }
+  if (decayMs >= renderMs) {
+    return "decay";
+  }
+  return "render";
+}
+
+function dominantShareFromTimings(depositionMs: number, decayMs: number, renderMs: number): number {
+  const total = depositionMs + decayMs + renderMs;
+  if (total <= 1e-6) {
+    return 0;
+  }
+  return Math.max(depositionMs, decayMs, renderMs) / total;
+}
+
+class RollingWindow {
+  private readonly values: number[] = [];
+
+  public constructor(private readonly maxSize: number) {}
+
+  public push(value: number): void {
+    this.values.push(value);
+    if (this.values.length > this.maxSize) {
+      this.values.shift();
+    }
+  }
+
+  public count(): number {
+    return this.values.length;
+  }
+
+  public min(): number {
+    if (this.values.length === 0) {
+      return 0;
+    }
+    return Math.min(...this.values);
+  }
+
+  public max(): number {
+    if (this.values.length === 0) {
+      return 0;
+    }
+    return Math.max(...this.values);
+  }
+
+  public spread(): number {
+    if (this.values.length === 0) {
+      return 0;
+    }
+    return this.max() - this.min();
+  }
+
+  public p95(): number {
+    if (this.values.length === 0) {
+      return 0;
+    }
+    const sorted = [...this.values].sort((a, b) => a - b);
+    const index = Math.max(0, Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1));
+    return sorted[index] ?? 0;
+  }
+}
+
+function downsampleScalarField(
   values: Float32Array,
   sourceWidth: number,
   sourceHeight: number,
-  sourceStride: number
+  sourceStride: number,
+  componentOffset: number,
+  componentsPerPixel: number
 ): Float32Array {
   const sample = new Float32Array(SAMPLE_TEXELS);
   if (sourceWidth <= 0 || sourceHeight <= 0 || sourceStride <= 0) {
@@ -619,8 +957,33 @@ function downsampleWetness(
     const sourceY = Math.min(sourceHeight - 1, Math.floor(((sy + 0.5) / SAMPLE_HEIGHT) * sourceHeight));
     for (let sx = 0; sx < SAMPLE_WIDTH; sx += 1) {
       const sourceX = Math.min(sourceWidth - 1, Math.floor(((sx + 0.5) / SAMPLE_WIDTH) * sourceWidth));
-      const sourceIndex = sourceY * sourceStride + sourceX;
+      const sourceIndex = sourceY * sourceStride + sourceX * componentsPerPixel + componentOffset;
       sample[sy * SAMPLE_WIDTH + sx] = values[sourceIndex] ?? 0;
+    }
+  }
+
+  return sample;
+}
+
+function downsampleFlowField(
+  values: Float32Array,
+  sourceWidth: number,
+  sourceHeight: number,
+  sourceStride: number
+): Float32Array {
+  const sample = new Float32Array(SAMPLE_TEXELS * FLOW_COMPONENTS_PER_PIXEL);
+  if (sourceWidth <= 0 || sourceHeight <= 0 || sourceStride <= 0) {
+    return sample;
+  }
+
+  for (let sy = 0; sy < SAMPLE_HEIGHT; sy += 1) {
+    const sourceY = Math.min(sourceHeight - 1, Math.floor(((sy + 0.5) / SAMPLE_HEIGHT) * sourceHeight));
+    for (let sx = 0; sx < SAMPLE_WIDTH; sx += 1) {
+      const sourceX = Math.min(sourceWidth - 1, Math.floor(((sx + 0.5) / SAMPLE_WIDTH) * sourceWidth));
+      const sourceIndex = sourceY * sourceStride + sourceX * FLOW_COMPONENTS_PER_PIXEL;
+      const sampleIndex = (sy * SAMPLE_WIDTH + sx) * FLOW_COMPONENTS_PER_PIXEL;
+      sample[sampleIndex] = values[sourceIndex] ?? 0;
+      sample[sampleIndex + 1] = values[sourceIndex + 1] ?? 0;
     }
   }
 

@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "startupMode": "always-atmospheric",
+  "staticStartup": {
+    "holdSeconds": 1.8,
+    "fadeInSeconds": 2.2
+  },
+  "scenePerVisit": {
+    "pool": [
+      "atrium-still",
+      "street-gif",
+      "city-video"
+    ]
+  },
+  "presentation": {
+    "autoRunTimeline": true,
+    "showDebugHud": false,
+    "showPersistentTuningPanel": false,
+    "launcher": {
+      "label": "MistyOS",
+      "studioRoute": "/studio",
+      "idleOpacity": 0.16,
+      "hoverOpacity": 0.9,
+      "shortcut": "Alt+Shift+M"
+    }
+  },
+  "studio": {
+    "timelinePanelDock": "bottom",
+    "enableDenseDebugTools": true
+  }
+}

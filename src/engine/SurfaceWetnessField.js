@@ -554,4 +554,16 @@ export class SurfaceWetnessField {
   getDisplayWetness() {
     return this.baseWetness
   }
+
+  getRenderSurfaces() {
+    return {
+      width: this.width,
+      height: this.height,
+      baseWetness: this.baseWetness,
+      grid: this.grid,
+      trailGrid: this.trailGrid,
+      runnerMemoryGrid: this.runnerMemoryGrid,
+      displayGrid: this.displayGrid,
+    }
+  }
 }

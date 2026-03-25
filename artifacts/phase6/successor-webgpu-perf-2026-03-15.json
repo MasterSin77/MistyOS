@@ -1,0 +1,71 @@
+{
+  "collectedAt": "2026-03-16T04:31:47.192Z",
+  "url": "http://127.0.0.1:5176/",
+  "harnessBoot": "runtime-entry bootstrapped from index session for measurement only",
+  "scenario": {
+    "id": "baseline-seed-001",
+    "resolution": {
+      "width": 1600,
+      "height": 900
+    },
+    "fixedDeltaMs": 16.6667,
+    "seed": 1337,
+    "renderMode": "comparison",
+    "preset": "night-boulevard"
+  },
+  "sampleWindow": {
+    "targetFrame": 1200,
+    "finalFrame": 1239
+  },
+  "adapter": {
+    "gpu": true,
+    "adapter": true,
+    "vendor": "nvidia",
+    "architecture": "blackwell",
+    "device": null,
+    "description": null,
+    "isFallbackAdapter": null,
+    "features": [
+      "depth32float-stencil8",
+      "rg11b10ufloat-renderable",
+      "bgra8unorm-storage",
+      "texture-formats-tier1",
+      "chromium-experimental-multi-draw-indirect",
+      "texture-compression-bc",
+      "dual-source-blending",
+      "core-features-and-limits",
+      "chromium-experimental-timestamp-query-inside-passes",
+      "float32-filterable",
+      "indirect-first-instance",
+      "float32-blendable",
+      "depth-clip-control",
+      "texture-compression-bc-sliced-3d",
+      "texture-formats-tier2",
+      "timestamp-query",
+      "clip-distances",
+      "shader-f16",
+      "primitive-index",
+      "texture-component-swizzle",
+      "subgroups"
+    ]
+  },
+  "timingCheckpoint": {
+    "frame": 1239,
+    "totalFrameMs": 0.2,
+    "depositionMs": 0,
+    "decayMs": 0.1,
+    "renderMs": 0.1,
+    "smoothedTotalFrameMs": 0.12,
+    "totalFrameP95Ms": 0.2,
+    "totalFrameMinMs": 0,
+    "totalFrameMaxMs": 0.4,
+    "stabilitySpreadMs": 0.4,
+    "dominantPass": "decay",
+    "dominantShare": 0.5
+  },
+  "raw": {
+    "status": "Mode: realtime | Scenario: baseline-seed-001 | Fixed dt: 16.6667 ms | Baseline approved: yes | View: comparison | Background: preset night-boulevard",
+    "comparisonLine": "comparison | renderMode=comparison | backgroundPreset=night-boulevard | backgroundApplied=true | backgroundMeanLuma=0.298 | simWallRatio=0.999 | simWallMs=20677.4 | simTimeMs=20666.7 | simThrottled=false | stageDisplay=1280x720 | canvasPixels=1600x900 | baselineApprovalGate=true | frameMs=0.20 | depMs=0.00 | decayMs=0.10 | renderMs=0.10 | p95Ms=0.20 | spreadMs=0.40 | dominant=decay(50.0%)",
+    "motionLine": "Runtime motion sanity\nframe: 1239\nclassification: structured-motion\nsimToWallRatio: 0.995\nsimClockState: stable\nwarning: none\nmeanWetness: 1.00000\nvariance: 0.000e+0\nactiveRatio: 100.00%\ntemporalDelta: 0.000e+0\nflowMeanMagnitude: 6.496e-3\nflowTemporalDelta: 7.124e-3\ndisturbanceMean: 1.976e-3\ndisturbanceActiveRatio: 1.46%\ndisturbanceTemporalDelta: 3.066e-3\ntiming(frame/dep/decay/render): 0.20 / 0.00 / 0.10 / 0.10 ms\ntiming(smoothed frame): 0.12 ms\ntiming(p95/min/max/spread): 0.20 / 0.00 / 0.40 / 0.40 ms\ntiming(dominant): decay (50.0%)\nsampledTexels: 1024 every 12 frames"
+  }
+}
