@@ -1,7 +1,9 @@
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value))
 import { RaindropFxRendererAdapter } from './RaindropFxRendererAdapter'
 import { SurfaceWetnessField } from './SurfaceWetnessField'
-import { DEFAULT_TUNING_CONFIG, deepClone, mergeDeep } from '../tuning/tuningConfig'
+import { createSchedulerRuntime } from '../scheduler/runtime'
+import { createFourQuadrantRegionModel } from '../scheduler/region-model'
+import { DEFAULT_TUNING_CONFIG, deepClone, getLinkedEffectiveConfig, mergeDeep } from '../tuning/tuningConfig'
 import { buildRuntimeWeatherDrivenConfig } from '../runtime/runtimeExecution'
 
 const ENGINE_SESSION_STARTUP_PHASES = {
@@ -22,6 +24,9 @@ const ENGINE_SIMULATION_CLOCK_PHASES = {
   LOCKED: 'locked',
   STOPPED: 'stopped',
 }
+
+const ENGINE_STARTUP_FIRST_LIVE_FRAME = 1
+const ENGINE_STARTUP_FRAME_SYNC_END_FRAME = ENGINE_STARTUP_FIRST_LIVE_FRAME + 1
 
 
 /**
@@ -124,10 +129,11 @@ export class WetSurfaceEngine {
       setTuningLineageTrace: [],
       canonicalPreStartBootstrap: null,
     }
-    // Slice A scaffold: engine-owned startup/session phase model.
-    // This is diagnostics-only in this pass; Presentation still drives startup behavior.
+    // Engine-owned startup/session phase model.
+    // Presentation startup wiring is compatibility-only and should not be authoritative.
     this.sessionStartupAuthority = {
       schemaVersion: 1,
+      owner: 'engine',
       currentPhase: ENGINE_SESSION_STARTUP_PHASES.CONSTRUCTED,
       phaseHistory: [
         {
@@ -150,6 +156,8 @@ export class WetSurfaceEngine {
         sawSteadyLive: false,
       },
       lastTransition: null,
+      compatibilityDemotedTraceCount: 0,
+      lastDemotedTrace: null,
     }
     // Slice B scaffold: engine-owned simulation clock/session timing model.
     // In this transitional pass it is diagnostics-first and mirrors current Presentation-driven
@@ -278,6 +286,13 @@ export class WetSurfaceEngine {
       clearingMs: 0,
       diffusionMs: 0,
       imageConvertMs: 0,
+      runtimeWeatherApplyAuthority: 'presentation-startup-shim',
+      runtimeWeatherApplySource: 'none',
+      runtimeWeatherApplyCallSite: 'none',
+      runtimeWeatherApplySequence: -1,
+      runtimeSteadyLiveApplyCount: 0,
+      runtimeStartupAuthorityOwner: 'engine',
+      runtimeStartupPhaseCurrent: ENGINE_SESSION_STARTUP_PHASES.CONSTRUCTED,
     }
     this.sceneAgeSec = 0
     this.wetnessFrameCounter = 0
@@ -307,6 +322,41 @@ export class WetSurfaceEngine {
     this.runtimeRainContractViolationLogged = false
     this.runnerCarveCurrentFrameProbes = []
     this.runnerCarvePendingRecoveryProbes = []
+    this.runtimeWeatherApplySequence = 0
+    this.schedulerRuntime = null
+    this.startupRuntimeAuthority = {
+      enabled: false,
+      runtimeSessionKey: null,
+      timelineId: null,
+      sceneId: null,
+      firstRainWindowSec: null,
+      basePreset: null,
+      includeDiagnostics: false,
+      canonicalZeroSamplePending: true,
+      firstLiveBoundaryPending: true,
+      lastPreFrameApplySignature: null,
+      lastStartupSyncFrameApplied: -1,
+      appliedCount: 0,
+      lastAppliedSampleSec: null,
+      lastAppliedNowMs: 0,
+      lastSource: 'none',
+      lastSampleCallSite: 'none',
+    }
+    this.steadyLiveAuthority = {
+      enabled: false,
+      runtimeSessionKey: null,
+      timelineId: null,
+      basePreset: null,
+      includeDiagnostics: false,
+      updateIntervalSec: 1 / 30,
+      accumulatorSec: 0,
+      applySequence: 0,
+      appliedCount: 0,
+      lastAppliedSampleSec: null,
+      lastAppliedNowMs: 0,
+      lastSource: 'none',
+      lastSampleCallSite: 'none',
+    }
 
     this.resize = this.resize.bind(this)
     this.animate = this.animate.bind(this)
@@ -357,6 +407,13 @@ export class WetSurfaceEngine {
       runtimeSessionKey: input.runtimeSessionKey != null ? String(input.runtimeSessionKey) : null,
     }
 
+    // Engine-owned boot-path classification for bootstrapInfo diagnostics.
+    // Presentation no longer mutates bootstrapInfo.refreshPath/publishRestartPath directly.
+    if (input.bootPath != null) {
+      const bootPathStr = String(input.bootPath)
+      this.bootstrapInfo.refreshPath = bootPathStr === 'refresh'
+      this.bootstrapInfo.publishRestartPath = bootPathStr === 'publish-restart'
+    }
   }
 
   setSimulationClockContext(context = null) {
@@ -371,6 +428,420 @@ export class WetSurfaceEngine {
         : this.simulationClockAuthority.session?.runtimeSessionKey ?? null,
       durationSec: nextDurationSec,
     }
+  }
+
+  setRuntimeSessionContext(context = null) {
+    const input = context && typeof context === 'object' ? context : {}
+    this.schedulerRuntime = createSchedulerRuntime(input.runtimeTimeline, {
+      regionModel: createFourQuadrantRegionModel({ softness: 0.45 }),
+      includeDiagnostics: input.includeDiagnostics === true,
+    })
+
+    this.setSessionStartupAuthorityContext({
+      runtimeSessionKey: input.runtimeSessionKey,
+      bootPath: input.bootPath,
+      publishRevision: input.publishRevision,
+      restartToken: input.restartToken,
+    })
+    this.setSimulationClockContext({
+      runtimeSessionKey: input.runtimeSessionKey,
+      durationSec: input.durationSec,
+    })
+    this.setStartupRuntimeContext({
+      enabled: input.startupEnabled,
+      runtimeSessionKey: input.runtimeSessionKey,
+      sceneId: input.sceneId,
+      timelineId: input.timelineId,
+      basePreset: input.basePreset,
+      includeDiagnostics: input.includeDiagnostics,
+      initialApplySequence: input.initialApplySequence,
+    })
+    this.setSteadyLiveRuntimeContext({
+      enabled: input.steadyLiveEnabled,
+      runtimeSessionKey: input.runtimeSessionKey,
+      timelineId: input.timelineId,
+      basePreset: input.basePreset,
+      includeDiagnostics: input.includeDiagnostics,
+      updateIntervalSec: input.updateIntervalSec,
+      initialApplySequence: input.initialApplySequence,
+    })
+  }
+
+  syncRuntimeWeatherApplySequence(nextSequence = 0) {
+    const candidate = Number.isFinite(Number(nextSequence)) ? Number(nextSequence) : 0
+    this.runtimeWeatherApplySequence = Math.max(Number(this.runtimeWeatherApplySequence || 0), candidate)
+  }
+
+  consumeRuntimeWeatherApplySequence() {
+    const sequence = Number(this.runtimeWeatherApplySequence || 0)
+    this.runtimeWeatherApplySequence = sequence + 1
+    return sequence
+  }
+
+  setStartupRuntimeContext(context = null) {
+    const input = context && typeof context === 'object' ? context : {}
+
+    this.startupRuntimeAuthority.enabled = input.enabled !== false
+    this.startupRuntimeAuthority.runtimeSessionKey = input.runtimeSessionKey != null ? String(input.runtimeSessionKey) : null
+    this.startupRuntimeAuthority.timelineId = input.timelineId != null ? String(input.timelineId) : null
+    this.startupRuntimeAuthority.sceneId = input.sceneId != null ? String(input.sceneId) : null
+    this.startupRuntimeAuthority.firstRainWindowSec = null
+    this.startupRuntimeAuthority.basePreset = input.basePreset && typeof input.basePreset === 'object'
+      ? deepClone(input.basePreset)
+      : null
+    this.startupRuntimeAuthority.includeDiagnostics = input.includeDiagnostics === true
+    this.startupRuntimeAuthority.canonicalZeroSamplePending = input.canonicalZeroSamplePending !== false
+    this.startupRuntimeAuthority.firstLiveBoundaryPending = input.firstLiveBoundaryPending !== false
+    this.startupRuntimeAuthority.lastPreFrameApplySignature = null
+    this.startupRuntimeAuthority.lastStartupSyncFrameApplied = -1
+    this.startupRuntimeAuthority.appliedCount = 0
+    this.startupRuntimeAuthority.lastAppliedSampleSec = null
+    this.startupRuntimeAuthority.lastAppliedNowMs = 0
+    this.startupRuntimeAuthority.lastSource = 'none'
+    this.startupRuntimeAuthority.lastSampleCallSite = 'none'
+
+    this.syncRuntimeWeatherApplySequence(input.initialApplySequence)
+  }
+
+  setSteadyLiveRuntimeContext(context = null) {
+    const input = context && typeof context === 'object' ? context : {}
+    const nextIntervalSec = Number.isFinite(Number(input.updateIntervalSec))
+      ? Math.max(1 / 120, Number(input.updateIntervalSec))
+      : 1 / 30
+
+    this.steadyLiveAuthority.enabled = input.enabled !== false
+    this.steadyLiveAuthority.runtimeSessionKey = input.runtimeSessionKey != null ? String(input.runtimeSessionKey) : null
+    this.steadyLiveAuthority.timelineId = input.timelineId != null ? String(input.timelineId) : null
+    this.steadyLiveAuthority.basePreset = input.basePreset && typeof input.basePreset === 'object'
+      ? deepClone(input.basePreset)
+      : null
+    this.steadyLiveAuthority.includeDiagnostics = input.includeDiagnostics === true
+    this.steadyLiveAuthority.updateIntervalSec = nextIntervalSec
+    this.steadyLiveAuthority.accumulatorSec = 0
+    this.steadyLiveAuthority.applySequence = Number.isFinite(Number(input.initialApplySequence))
+      ? Number(input.initialApplySequence)
+      : 0
+    this.steadyLiveAuthority.appliedCount = 0
+    this.steadyLiveAuthority.lastAppliedSampleSec = null
+    this.steadyLiveAuthority.lastAppliedNowMs = 0
+    this.steadyLiveAuthority.lastSource = 'none'
+    this.steadyLiveAuthority.lastSampleCallSite = 'none'
+
+    this.syncRuntimeWeatherApplySequence(input.initialApplySequence)
+  }
+
+  withSchedulerInvariantHints(drivenConfig, weather) {
+    if (!drivenConfig) {
+      return null
+    }
+
+    return {
+      ...drivenConfig,
+      debug: {
+        ...(drivenConfig.debug || {}),
+        runtimeSchedulerRainActive: Number(weather?.rain || 0) > 0.001,
+        runtimeSampledRainIntensity: Number(weather?.rain || 0),
+      },
+    }
+  }
+
+  summarizeRainTrackInputs(snapshot) {
+    const contributions = Array.isArray(snapshot?.diagnostics?.weatherTrackContributions)
+      ? snapshot.diagnostics.weatherTrackContributions
+      : []
+
+    return contributions
+      .filter((entry) => entry?.kind === 'rain')
+      .map((entry) => ({
+        trackKey: String(entry?.trackKey || ''),
+        contribution: Number(entry?.contribution || 0),
+        envelopeValue: Number(entry?.envelopeValue || 0),
+        interpolationT: Number(entry?.interpolationT || 0),
+        previousPointTimeSec: Number(entry?.previousPoint?.timeSec || 0),
+        previousPointValue: Number(entry?.previousPoint?.value || 0),
+        nextPointTimeSec: Number(entry?.nextPoint?.timeSec || 0),
+        nextPointValue: Number(entry?.nextPoint?.value || 0),
+        sourceClipIds: Array.isArray(entry?.sourceClipIds) ? [...entry.sourceClipIds] : [],
+      }))
+  }
+
+  applyRuntimeWeatherSnapshot(options = {}) {
+    const basePreset = options?.basePreset || null
+    const snapshot = options?.snapshot || null
+    const weather = snapshot?.weather || null
+    if (!basePreset || !weather) {
+      return null
+    }
+
+    const source = String(options?.source || 'engine:runtime-authority')
+    const sampleCallSite = String(options?.sampleCallSite || 'engine:runtime-scheduler-sample')
+    const phaseTag = String(options?.phaseTag || 'non-startup')
+    const applyBoundary = String(options?.applyBoundary || 'engine-runtime-boundary')
+    const runtimeSessionKey = options?.runtimeSessionKey != null
+      ? String(options.runtimeSessionKey)
+      : this.sessionStartupAuthority.session?.runtimeSessionKey || null
+    const rawElapsedSec = Number.isFinite(Number(options?.sampleElapsedSec)) ? Number(options.sampleElapsedSec) : 0
+    const sequence = this.consumeRuntimeWeatherApplySequence()
+    const drivenConfig = buildRuntimeWeatherDrivenConfig(basePreset, weather)
+    const hintedConfig = this.withSchedulerInvariantHints(drivenConfig, weather)
+    const linkedConfig = getLinkedEffectiveConfig(hintedConfig)
+    const extraTrace = options?.extraTrace && typeof options.extraTrace === 'object' ? options.extraTrace : {}
+
+    this.enqueueRuntimeInputEnvelope({
+      source,
+      phaseTag,
+      sampleCallSite,
+      applyBoundary,
+      sequence,
+      runtimeSessionKey,
+      sample: {
+        rawElapsedSec,
+        sampleSec: Number(snapshot?.sampleSec || 0),
+      },
+      weather,
+      derivedConfig: hintedConfig,
+      linkedConfig,
+      tuningApplyTrace: {
+        sampleCallSite,
+        sampleSequence: sequence,
+        startupPhaseTag: phaseTag,
+        startupInvocationSource: String(options?.startupInvocationSource || source),
+        startupSequenceIndex: sequence,
+        startupEngineFrame: Number(this.wetnessFrameCounter || 0),
+        startupWetnessFrameCounter: Number(this.timing?.wetnessFrameCounter || this.wetnessFrameCounter || 0),
+        startupPacketId: Number(this.timing?.runnerCarveDiagnosticsPacketId ?? -1),
+        rawElapsedSec,
+        normalizedSampleSec: Number(snapshot?.sampleSec || 0),
+        sampledRainIntensityBeforeDerive: Number(weather?.rain || 0),
+        derivedRainIntensity: Number(hintedConfig?.renderer?.rainIntensity || 0),
+        derivedDropletsPerSeconds: Number(hintedConfig?.renderer?.dropletsPerSeconds || 0),
+        rainTrackInputs: this.summarizeRainTrackInputs(snapshot),
+        ...extraTrace,
+      },
+    })
+    this.consumeRuntimeInputQueueAtBoundary(applyBoundary)
+
+    return {
+      sequence,
+      weather,
+      drivenConfig,
+      hintedConfig,
+      linkedConfig,
+      snapshot,
+    }
+  }
+
+  resolveStartupRuntimeSamplePlan() {
+    const authority = this.startupRuntimeAuthority
+    const engineFrame = Number(this.wetnessFrameCounter || 0)
+    if (!authority.enabled || !this.schedulerRuntime || !authority.basePreset) {
+      return null
+    }
+
+    if (this.sessionStartupAuthority.currentPhase === ENGINE_SESSION_STARTUP_PHASES.STOPPED) {
+      return null
+    }
+
+    if (this.sessionStartupAuthority.flags?.sawSteadyLive) {
+      return null
+    }
+
+    if (authority.canonicalZeroSamplePending) {
+      return {
+        sampleElapsedSec: 0,
+        sampleCallSite: 'engine:startup-canonical-zero-handoff',
+        startupPhaseTag: 'pre-live-hold',
+        applyBoundary: 'engine-startup-boundary',
+        startupInvocationSource: 'engine-startup-loop',
+        preFrameSignature: JSON.stringify({
+          engineFrame,
+          sampleElapsedSec: 0,
+        }),
+      }
+    }
+
+    if (authority.firstLiveBoundaryPending) {
+      if (engineFrame < ENGINE_STARTUP_FIRST_LIVE_FRAME) {
+        return {
+          sampleElapsedSec: 0,
+          sampleCallSite: 'engine:startup-frame0-hold',
+          startupPhaseTag: 'pre-live-hold',
+          applyBoundary: 'engine-startup-boundary',
+          startupInvocationSource: 'engine-startup-loop',
+          preFrameSignature: JSON.stringify({
+            engineFrame,
+            sampleElapsedSec: 0,
+          }),
+        }
+      }
+
+      return {
+        sampleElapsedSec: ENGINE_STARTUP_FIRST_LIVE_FRAME / 60,
+        sampleCallSite: 'engine:startup-first-live-boundary',
+        startupPhaseTag: 'first-live-boundary',
+        applyBoundary: 'engine-startup-boundary',
+        startupInvocationSource: 'engine-startup-loop',
+      }
+    }
+
+    if (engineFrame <= ENGINE_STARTUP_FRAME_SYNC_END_FRAME && authority.lastStartupSyncFrameApplied !== engineFrame) {
+      return {
+        sampleElapsedSec: engineFrame / 60,
+        sampleCallSite: 'engine:startup-frame-sync',
+        startupPhaseTag: 'startup-frame-sync',
+        applyBoundary: 'engine-startup-boundary',
+        startupInvocationSource: 'engine-startup-loop',
+      }
+    }
+
+    return null
+  }
+
+  runStartupRuntimeAuthorityBoundary(nowMs = performance.now()) {
+    const authority = this.startupRuntimeAuthority
+    const plan = this.resolveStartupRuntimeSamplePlan()
+    if (!plan) {
+      return null
+    }
+
+    const sampleElapsedSec = Number(plan.sampleElapsedSec || 0)
+    this.noteSimulationSampleBoundary({
+      elapsedSec: sampleElapsedSec,
+      callSite: plan.sampleCallSite,
+      startupPhaseTag: plan.startupPhaseTag,
+      engineFrame: Number(this.wetnessFrameCounter || 0),
+      nowMs,
+    })
+
+    if (plan.preFrameSignature && authority.lastPreFrameApplySignature === plan.preFrameSignature) {
+      if (plan.sampleCallSite === 'engine:startup-canonical-zero-handoff') {
+        authority.canonicalZeroSamplePending = false
+      }
+      return null
+    }
+
+    const snapshot = this.schedulerRuntime.sample({
+      elapsedSec: sampleElapsedSec,
+      fps: 60,
+      includeDiagnostics: authority.includeDiagnostics,
+    })
+    const applied = this.applyRuntimeWeatherSnapshot({
+      basePreset: authority.basePreset,
+      source: 'engine:startup-authority',
+      phaseTag: plan.startupPhaseTag,
+      sampleCallSite: plan.sampleCallSite,
+      applyBoundary: plan.applyBoundary,
+      runtimeSessionKey: authority.runtimeSessionKey,
+      sampleElapsedSec,
+      snapshot,
+      startupInvocationSource: plan.startupInvocationSource,
+      extraTrace: {
+        runtimeTimelineId: authority.timelineId,
+        runtimeSceneId: authority.sceneId,
+      },
+    })
+    if (!applied) {
+      return null
+    }
+
+    if (plan.preFrameSignature) {
+      authority.lastPreFrameApplySignature = plan.preFrameSignature
+    }
+    if (plan.sampleCallSite === 'engine:startup-canonical-zero-handoff') {
+      authority.canonicalZeroSamplePending = false
+    }
+    if (plan.sampleCallSite === 'engine:startup-first-live-boundary') {
+      authority.firstLiveBoundaryPending = false
+      authority.lastPreFrameApplySignature = null
+    }
+    if (plan.sampleCallSite === 'engine:startup-frame-sync') {
+      authority.lastStartupSyncFrameApplied = Number(this.wetnessFrameCounter || 0)
+    }
+
+    authority.appliedCount += 1
+    authority.lastAppliedSampleSec = Number(snapshot?.sampleSec || 0)
+    authority.lastAppliedNowMs = Number(nowMs || 0)
+    authority.lastSource = 'engine:startup-authority'
+    authority.lastSampleCallSite = plan.sampleCallSite
+
+    this.timing.runtimeWeatherApplyAuthority = 'engine-startup'
+    return snapshot
+  }
+
+  runSteadyLiveAuthorityBoundary(dtSec, nowMs = performance.now()) {
+    const authority = this.steadyLiveAuthority
+    if (!authority.enabled) {
+      return null
+    }
+
+    if (!this.schedulerRuntime || !authority.basePreset) {
+      return null
+    }
+
+    if (!this.sessionStartupAuthority.flags?.sawFirstLiveBoundary) {
+      return null
+    }
+
+    if (this.wetnessFrameCounter < ENGINE_STARTUP_FRAME_SYNC_END_FRAME) {
+      return null
+    }
+
+    if (this.sessionStartupAuthority.currentPhase === ENGINE_SESSION_STARTUP_PHASES.STOPPED) {
+      return null
+    }
+
+    const dt = Number.isFinite(Number(dtSec)) ? Math.max(0, Number(dtSec)) : 0
+    authority.accumulatorSec += dt
+    if (authority.accumulatorSec < authority.updateIntervalSec) {
+      return null
+    }
+    authority.accumulatorSec = 0
+
+    const sampleElapsedSec = this.sampleSimulationClock(nowMs)
+    const sampleCallSite = 'engine:steady-live-scheduler-sample'
+    this.noteSimulationSampleBoundary({
+      elapsedSec: sampleElapsedSec,
+      callSite: sampleCallSite,
+      startupPhaseTag: 'non-startup',
+      engineFrame: Number(this.wetnessFrameCounter || 0),
+      nowMs,
+    })
+
+    const snapshot = this.schedulerRuntime.sample({
+      elapsedSec: sampleElapsedSec,
+      fps: 60,
+      includeDiagnostics: authority.includeDiagnostics,
+    })
+    const weather = snapshot?.weather || null
+    if (!weather) {
+      return null
+    }
+
+    const applied = this.applyRuntimeWeatherSnapshot({
+      basePreset: authority.basePreset,
+      source: 'engine:steady-live-authority',
+      phaseTag: 'non-startup',
+      sampleCallSite,
+      applyBoundary: 'engine-steady-live-boundary',
+      runtimeSessionKey: authority.runtimeSessionKey || this.sessionStartupAuthority.session?.runtimeSessionKey || null,
+      sampleElapsedSec,
+      snapshot,
+      startupInvocationSource: 'engine-steady-live-loop',
+    })
+    if (!applied) {
+      return null
+    }
+
+    authority.applySequence = Number(applied.sequence || 0) + 1
+    authority.appliedCount += 1
+    authority.lastAppliedSampleSec = Number(snapshot?.sampleSec || 0)
+    authority.lastAppliedNowMs = Number(nowMs || 0)
+    authority.lastSource = 'engine:steady-live-authority'
+    authority.lastSampleCallSite = sampleCallSite
+
+    this.timing.runtimeWeatherApplyAuthority = 'engine-steady-live'
+    this.timing.runtimeSteadyLiveApplyCount = Number(authority.appliedCount || 0)
+    return snapshot
   }
 
   normalizeSimulationClockLoopTime(timeSec) {
@@ -494,31 +965,6 @@ export class WetSurfaceEngine {
     return currentSec
   }
 
-  mirrorPresentationClockSample(sample = null) {
-    const input = sample && typeof sample === 'object' ? sample : {}
-    const nowMs = Number.isFinite(Number(input.nowMs)) ? Number(input.nowMs) : Number(performance.now() || 0)
-    const currentTimeSec = Number.isFinite(Number(input.currentTimeSec)) ? Math.max(0, Number(input.currentTimeSec)) : null
-
-    if (currentTimeSec === null) {
-      return
-    }
-
-    this.simulationClockAuthority.currentTimeSec = currentTimeSec
-    this.simulationClockAuthority.loopTimeSec = this.normalizeSimulationClockLoopTime(currentTimeSec)
-    this.simulationClockAuthority.lastOperation = `mirror:${String(input.source || 'presentation')}`
-    this.updateSimulationClockPhaseFromStartup()
-
-    this.pushSimulationClockHistory({
-      op: 'mirror',
-      source: String(input.source || 'presentation'),
-      callSite: String(input.callSite || ''),
-      currentTimeSec,
-      atNowMs: nowMs,
-      phase: this.simulationClockAuthority.phase,
-      startupPhase: this.simulationClockAuthority.startupPhaseAtLastUpdate,
-    })
-  }
-
   noteSimulationSampleBoundary(boundary = null) {
     const input = boundary && typeof boundary === 'object' ? boundary : {}
     const elapsedSec = Number.isFinite(Number(input.elapsedSec)) ? Math.max(0, Number(input.elapsedSec)) : null
@@ -611,6 +1057,62 @@ export class WetSurfaceEngine {
     this.updateSimulationClockPhaseFromStartup()
   }
 
+  driveStartupPhaseFromEngineBoundary(nowMs = performance.now()) {
+    if (!this.running) {
+      return
+    }
+
+    if (this.sessionStartupAuthority.currentPhase === ENGINE_SESSION_STARTUP_PHASES.STOPPED) {
+      return
+    }
+
+    if (
+      !this.sessionStartupAuthority.flags.sawCanonicalBootstrap &&
+      (this.bootstrapInfo.canonicalPreStartBootstrap || this.bootstrapInfo.initialWeatherApplied)
+    ) {
+      this.advanceSessionStartupPhase(ENGINE_SESSION_STARTUP_PHASES.CANONICAL_BOOTSTRAP_APPLIED, 'engine:canonical-bootstrap-ready', {
+        atNowMs: Number(nowMs || 0),
+      })
+    }
+
+    if (
+      this.sessionStartupAuthority.flags.sawCanonicalBootstrap &&
+      !this.sessionStartupAuthority.flags.sawStartupHold &&
+      this.wetnessFrameCounter <= 0
+    ) {
+      this.advanceSessionStartupPhase(ENGINE_SESSION_STARTUP_PHASES.STARTUP_HOLD, 'engine:startup-hold-frame0', {
+        atNowMs: Number(nowMs || 0),
+      })
+    }
+
+    if (
+      this.sessionStartupAuthority.flags.sawStartupHold &&
+      !this.sessionStartupAuthority.flags.sawFirstLiveBoundary &&
+      this.wetnessFrameCounter >= ENGINE_STARTUP_FIRST_LIVE_FRAME
+    ) {
+      const firstLiveElapsedSec = this.sampleSimulationClock(nowMs)
+      this.noteSimulationSampleBoundary({
+        elapsedSec: firstLiveElapsedSec,
+        callSite: 'engine:startup-first-live-boundary',
+        startupPhaseTag: 'first-live-boundary',
+        engineFrame: Number(this.wetnessFrameCounter || 0),
+        nowMs,
+      })
+      this.advanceSessionStartupPhase(ENGINE_SESSION_STARTUP_PHASES.FIRST_LIVE_BOUNDARY_REACHED, 'engine:first-live-boundary-frame1', {
+        firstLiveSampleSec: Number(firstLiveElapsedSec || 0),
+      })
+    }
+
+    if (
+      this.sessionStartupAuthority.flags.sawFirstLiveBoundary &&
+      !this.sessionStartupAuthority.flags.sawSteadyLive &&
+      Number(this.steadyLiveAuthority?.appliedCount || 0) > 0 &&
+      this.wetnessFrameCounter >= ENGINE_STARTUP_FRAME_SYNC_END_FRAME
+    ) {
+      this.advanceSessionStartupPhase(ENGINE_SESSION_STARTUP_PHASES.STEADY_LIVE, 'engine:steady-live-authority')
+    }
+  }
+
   updateSessionStartupPhaseFromTuningTrace(stagedApplyTrace = null) {
     const trace = stagedApplyTrace && typeof stagedApplyTrace === 'object' ? stagedApplyTrace : null
     if (!trace) {
@@ -620,6 +1122,17 @@ export class WetSurfaceEngine {
     const sampleCallSite = String(trace.sampleCallSite || '')
     const startupPhaseTag = String(trace.startupPhaseTag || '')
 
+    if (this.sessionStartupAuthority.owner === 'engine' && !sampleCallSite.startsWith('engine:')) {
+      this.sessionStartupAuthority.compatibilityDemotedTraceCount += 1
+      this.sessionStartupAuthority.lastDemotedTrace = {
+        sampleCallSite,
+        startupPhaseTag,
+        atWetnessFrameCounter: Number(this.wetnessFrameCounter || 0),
+        atPerfNowMs: Number(performance.now() || 0),
+      }
+      return
+    }
+
     if (startupPhaseTag === 'canonical-bootstrap' || sampleCallSite.startsWith('start:')) {
       this.advanceSessionStartupPhase(ENGINE_SESSION_STARTUP_PHASES.CANONICAL_BOOTSTRAP_APPLIED, sampleCallSite || startupPhaseTag)
       return
@@ -628,18 +1141,36 @@ export class WetSurfaceEngine {
     if (
       startupPhaseTag === 'pre-live-hold' ||
       sampleCallSite === 'updateAtmosphere:canonical-zero-handoff' ||
-      sampleCallSite === 'updateAtmosphere:startup-frame0-hold'
+      sampleCallSite === 'updateAtmosphere:startup-frame0-hold' ||
+      sampleCallSite === 'engine:startup-canonical-zero-handoff' ||
+      sampleCallSite === 'engine:startup-frame0-hold'
     ) {
       this.advanceSessionStartupPhase(ENGINE_SESSION_STARTUP_PHASES.STARTUP_HOLD, sampleCallSite || startupPhaseTag)
       return
     }
 
-    if (startupPhaseTag === 'first-live-boundary' || sampleCallSite === 'onStats:startup-first-live-boundary') {
+    if (
+      startupPhaseTag === 'first-live-boundary' ||
+      sampleCallSite === 'onStats:startup-first-live-boundary' ||
+      sampleCallSite === 'engine:startup-first-live-boundary'
+    ) {
       this.advanceSessionStartupPhase(ENGINE_SESSION_STARTUP_PHASES.FIRST_LIVE_BOUNDARY_REACHED, sampleCallSite || startupPhaseTag)
       return
     }
 
-    if (startupPhaseTag === 'non-startup' || sampleCallSite === 'updateAtmosphere:getPresentationTimeSec') {
+    if (
+      startupPhaseTag === 'startup-frame-sync' ||
+      sampleCallSite === 'updateAtmosphere:startup-frame-sync' ||
+      sampleCallSite === 'engine:startup-frame-sync'
+    ) {
+      return
+    }
+
+    if (
+      startupPhaseTag === 'non-startup' ||
+      sampleCallSite === 'updateAtmosphere:getPresentationTimeSec' ||
+      sampleCallSite === 'engine:steady-live-scheduler-sample'
+    ) {
       if (this.sessionStartupAuthority.flags.sawFirstLiveBoundary) {
         this.advanceSessionStartupPhase(ENGINE_SESSION_STARTUP_PHASES.STEADY_LIVE, sampleCallSite || startupPhaseTag)
       }
@@ -649,6 +1180,7 @@ export class WetSurfaceEngine {
   getSessionStartupAuthoritySnapshot() {
     return {
       schemaVersion: Number(this.sessionStartupAuthority.schemaVersion || 1),
+      owner: String(this.sessionStartupAuthority.owner || 'engine'),
       currentPhase: String(this.sessionStartupAuthority.currentPhase || ENGINE_SESSION_STARTUP_PHASES.CONSTRUCTED),
       session: {
         runtimeSessionKey: this.sessionStartupAuthority.session?.runtimeSessionKey ?? null,
@@ -664,6 +1196,10 @@ export class WetSurfaceEngine {
       },
       lastTransition: this.sessionStartupAuthority.lastTransition
         ? { ...this.sessionStartupAuthority.lastTransition }
+        : null,
+      compatibilityDemotedTraceCount: Number(this.sessionStartupAuthority.compatibilityDemotedTraceCount || 0),
+      lastDemotedTrace: this.sessionStartupAuthority.lastDemotedTrace
+        ? { ...this.sessionStartupAuthority.lastDemotedTrace }
         : null,
       phaseHistory: Array.isArray(this.sessionStartupAuthority.phaseHistory)
         ? this.sessionStartupAuthority.phaseHistory.map((entry) => ({ ...entry }))
@@ -785,6 +1321,17 @@ export class WetSurfaceEngine {
       this.runtimeInputAuthority.recentConsumedEnvelopes.shift()
     }
 
+    this.timing.runtimeWeatherApplySource = String(envelope.source || 'unknown')
+    this.timing.runtimeWeatherApplyCallSite = String(envelope.sampleCallSite || 'unknown')
+    this.timing.runtimeWeatherApplySequence = Number.isFinite(Number(envelope.sequence)) ? Number(envelope.sequence) : -1
+    if (String(envelope.source || '').startsWith('engine:startup')) {
+      this.timing.runtimeWeatherApplyAuthority = 'engine-startup'
+    }
+    if (String(envelope.source || '').startsWith('engine:steady-live')) {
+      this.timing.runtimeWeatherApplyAuthority = 'engine-steady-live'
+      this.timing.runtimeSteadyLiveApplyCount = Number(this.steadyLiveAuthority?.appliedCount || 0)
+    }
+
     return envelope
   }
 
@@ -816,7 +1363,7 @@ export class WetSurfaceEngine {
   }
 
   resolveCanonicalPreStartBootstrap(options = {}) {
-    const schedulerRuntime = options?.schedulerRuntime || null
+    const schedulerRuntime = options?.schedulerRuntime || this.schedulerRuntime || null
     const basePreset = options?.basePreset || null
     const timelineDurationSec = Number.isFinite(Number(options?.timelineDurationSec))
       ? Number(options.timelineDurationSec)
@@ -923,6 +1470,99 @@ export class WetSurfaceEngine {
     return result
   }
 
+  runCanonicalBootstrapAuthority(options = {}) {
+    const input = options && typeof options === 'object' ? options : {}
+    const runtimeSessionKey = input.runtimeSessionKey != null
+      ? String(input.runtimeSessionKey)
+      : this.startupRuntimeAuthority.runtimeSessionKey || this.sessionStartupAuthority.session?.runtimeSessionKey || null
+    const schedulerRuntime = this.schedulerRuntime || null
+    const basePreset = input.basePreset || this.startupRuntimeAuthority.basePreset || null
+    const timelineDurationSec = Number.isFinite(Number(input.timelineDurationSec))
+      ? Number(input.timelineDurationSec)
+      : Number(this.simulationClockAuthority.session?.durationSec || 180)
+    const sampleCallSite = String(input.sampleCallSite || 'start:shared-pre-start-bootstrap')
+    const startupInvocationSource = String(input.startupInvocationSource || 'engine-bootstrap-authority')
+
+    const bootstrap = this.resolveCanonicalPreStartBootstrap({
+      schedulerRuntime,
+      basePreset,
+      timelineDurationSec,
+    })
+
+    if (bootstrap?.drivenConfig) {
+      this.startupRuntimeAuthority.firstRainWindowSec = Number.isFinite(Number(bootstrap.firstRainWindowSec))
+        ? Number(bootstrap.firstRainWindowSec)
+        : null
+      const sequence = this.consumeRuntimeWeatherApplySequence()
+      const hintedConfig = this.withSchedulerInvariantHints(bootstrap.drivenConfig, bootstrap.weather)
+      this.stageTuningApplyTrace({
+        sampleCallSite,
+        sampleSequence: sequence,
+        startupPhaseTag: 'canonical-bootstrap',
+        startupInvocationSource,
+        startupSequenceIndex: sequence,
+        startupEngineFrame: Number(this.wetnessFrameCounter || 0),
+        startupWetnessFrameCounter: Number(this.wetnessFrameCounter || 0),
+        startupPacketId: -1,
+        rawElapsedSec: Number(bootstrap.preStartSec || 0),
+        normalizedSampleSec: Number(bootstrap.preStartSnap?.sampleSec || bootstrap.preStartSec || 0),
+        sampledRainIntensityBeforeDerive: Number(bootstrap.weather?.rain || 0),
+        derivedRainIntensity: Number(hintedConfig?.renderer?.rainIntensity || 0),
+        derivedDropletsPerSeconds: Number(hintedConfig?.renderer?.dropletsPerSeconds || 0),
+        rainTrackInputs: this.summarizeRainTrackInputs(bootstrap.preStartSnap),
+      })
+      this.setTuningConfig(getLinkedEffectiveConfig(hintedConfig))
+      this.timing.runtimeWeatherApplyAuthority = 'engine-startup'
+      this.timing.runtimeWeatherApplySource = 'engine:bootstrap-authority'
+      this.timing.runtimeWeatherApplyCallSite = sampleCallSite
+      this.timing.runtimeWeatherApplySequence = Number(sequence)
+      this.startupRuntimeAuthority.lastSource = 'engine:bootstrap-authority'
+      this.startupRuntimeAuthority.lastSampleCallSite = sampleCallSite
+      this.startupRuntimeAuthority.lastAppliedSampleSec = Number(bootstrap.preStartSnap?.sampleSec || bootstrap.preStartSec || 0)
+      this.startupRuntimeAuthority.lastAppliedNowMs = Number(performance.now() || 0)
+      this.startupRuntimeAuthority.appliedCount = Number(this.startupRuntimeAuthority.appliedCount || 0) + 1
+
+      return {
+        ...bootstrap,
+        runtimeSessionKey,
+        applied: true,
+        applySequence: Number(sequence),
+      }
+    }
+
+    return {
+      ...bootstrap,
+      runtimeSessionKey,
+      applied: false,
+      applySequence: null,
+    }
+  }
+
+  seekToBootstrapFirstRainWindow(options = {}) {
+    const input = options && typeof options === 'object' ? options : {}
+    const firstRainWindowSec = Number(this.startupRuntimeAuthority.firstRainWindowSec)
+    if (!Number.isFinite(firstRainWindowSec) || firstRainWindowSec <= 0) {
+      return {
+        applied: false,
+        targetSec: null,
+      }
+    }
+
+    const durationSec = Math.max(0.001, Number(this.simulationClockAuthority.session?.durationSec || 180))
+    const clampedSec = clamp(firstRainWindowSec, 0, durationSec)
+    const nowMs = Number.isFinite(Number(input.nowMs)) ? Number(input.nowMs) : Number(performance.now() || 0)
+    this.seekSimulationClock(clampedSec, {
+      reason: String(input.reason || 'engine-seek-bootstrap-first-rain-window'),
+      lockAtTarget: input.lockAtTarget === true,
+      nowMs,
+    })
+
+    return {
+      applied: true,
+      targetSec: clampedSec,
+    }
+  }
+
   resolveSetTuningOriginBucket(stagedApplyTrace) {
     const source = stagedApplyTrace && typeof stagedApplyTrace === 'object' ? stagedApplyTrace : {}
     const sampleCallSite = String(source?.sampleCallSite || '')
@@ -931,17 +1571,27 @@ export class WetSurfaceEngine {
     if (sampleCallSite.startsWith('start:') || startupPhaseTag === 'canonical-bootstrap') {
       return 'canonical-bootstrap'
     }
-    if (sampleCallSite === 'updateAtmosphere:startup-frame-sync' || startupPhaseTag === 'startup-frame-sync') {
+    if (
+      sampleCallSite === 'updateAtmosphere:startup-frame-sync' ||
+      sampleCallSite === 'engine:startup-frame-sync' ||
+      startupPhaseTag === 'startup-frame-sync'
+    ) {
       return 'startup-frame-sync'
     }
     if (
       sampleCallSite === 'updateAtmosphere:canonical-zero-handoff' ||
       sampleCallSite === 'updateAtmosphere:startup-frame0-hold' ||
+      sampleCallSite === 'engine:startup-canonical-zero-handoff' ||
+      sampleCallSite === 'engine:startup-frame0-hold' ||
       startupPhaseTag === 'pre-live-hold'
     ) {
       return 'pre-live-hold'
     }
-    if (sampleCallSite === 'onStats:startup-first-live-boundary' || startupPhaseTag === 'first-live-boundary') {
+    if (
+      sampleCallSite === 'onStats:startup-first-live-boundary' ||
+      sampleCallSite === 'engine:startup-first-live-boundary' ||
+      startupPhaseTag === 'first-live-boundary'
+    ) {
       return 'first-live-boundary'
     }
     if (sampleCallSite === 'engine:bootstrap-seed' || startupPhaseTag === 'engine-seed') {
@@ -3650,9 +4300,15 @@ export class WetSurfaceEngine {
     const isFirstStartupFrame = this.wetnessFrameCounter === 0
     const dt = isFirstStartupFrame ? 0 : clamp(rawDtSec, 0, 0.08)
     this.noteSimulationFrameAdvance(dt, now)
+    this.driveStartupPhaseFromEngineBoundary(now)
+    this.runStartupRuntimeAuthorityBoundary(now)
+    this.runSteadyLiveAuthorityBoundary(dt, now)
+    this.driveStartupPhaseFromEngineBoundary(now)
     this.timing.wetnessBackend = 'cpu-grid'
     this.timing.interactionBackend = 'cpu-direct'
     this.timing.gpuInteractionWritesQueued = this.gpuInteractionWriteQueue.length
+    this.timing.runtimeStartupAuthorityOwner = String(this.sessionStartupAuthority.owner || 'engine')
+    this.timing.runtimeStartupPhaseCurrent = String(this.sessionStartupAuthority.currentPhase || ENGINE_SESSION_STARTUP_PHASES.CONSTRUCTED)
     this.sceneAgeSec += dt
     const frameStart = performance.now()
     const frameDeltaMs = this.lastFrameTimestamp > 0 ? now - this.lastFrameTimestamp : 16.7
@@ -4092,6 +4748,13 @@ export class WetSurfaceEngine {
         runtimeInputQueueDepth: Array.isArray(this.runtimeInputQueue) ? this.runtimeInputQueue.length : 0,
         runtimeInputEnqueuedCount: Number(this.runtimeInputAuthority.enqueuedCount || 0),
         runtimeInputConsumedCount: Number(this.runtimeInputAuthority.consumedCount || 0),
+        runtimeWeatherApplyAuthority: this.timing.runtimeWeatherApplyAuthority,
+        runtimeWeatherApplySource: this.timing.runtimeWeatherApplySource,
+        runtimeWeatherApplyCallSite: this.timing.runtimeWeatherApplyCallSite,
+        runtimeWeatherApplySequence: this.timing.runtimeWeatherApplySequence,
+        runtimeSteadyLiveApplyCount: this.timing.runtimeSteadyLiveApplyCount,
+        runtimeStartupAuthorityOwner: this.timing.runtimeStartupAuthorityOwner,
+        runtimeStartupPhaseCurrent: this.timing.runtimeStartupPhaseCurrent,
       },
       bootstrap: {
         rendererCreated: this.bootstrapInfo.rendererCreated,

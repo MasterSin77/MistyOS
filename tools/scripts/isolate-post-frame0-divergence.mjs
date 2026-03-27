@@ -13,6 +13,8 @@ const BOOT_TIMEOUT_MS = Number(process.env.MISTYOS_BOOT_TIMEOUT_MS || 20000)
 const FRAME_DIAGNOSTIC_COUNT = Number(process.env.MISTYOS_FRAME_DIAGNOSTIC_COUNT || 20)
 const FLOAT_EPSILON = Number(process.env.MISTYOS_FLOAT_EPSILON || 1e-9)
 const NON_DETERMINISTIC_CALLSITE = 'updateAtmosphere:getPresentationTimeSec'
+const ENGINE_STARTUP_BOUNDARY_CALLSITE = 'engine:startup-first-live-boundary'
+const ENGINE_STARTUP_SYNC_CALLSITE = 'engine:startup-frame-sync'
 
 function fail(details) {
   throw new Error(JSON.stringify({ ok: false, ...details }, null, 2))
@@ -48,7 +50,12 @@ function isWallClockDrivenCallSite(callSite) {
 
 function isExpectedStartupLiveBoundaryCallSite(callSite) {
   const value = String(callSite || '')
-  return value === 'updateAtmosphere:startup-frame-sync' || value === NON_DETERMINISTIC_CALLSITE
+  return (
+    value === 'updateAtmosphere:startup-frame-sync' ||
+    value === ENGINE_STARTUP_BOUNDARY_CALLSITE ||
+    value === ENGINE_STARTUP_SYNC_CALLSITE ||
+    value === NON_DETERMINISTIC_CALLSITE
+  )
 }
 
 async function addDeterministicSeedScript(context, seed) {
@@ -215,7 +222,10 @@ function sameIdentity(left, right) {
 }
 
 function findFirstLiveBoundaryIndex(trace) {
-  return trace.findIndex((entry) => entry.sampleCallSite === 'onStats:startup-first-live-boundary')
+  return trace.findIndex((entry) => {
+    const sampleCallSite = String(entry?.sampleCallSite || '')
+    return sampleCallSite === 'onStats:startup-first-live-boundary' || sampleCallSite === ENGINE_STARTUP_BOUNDARY_CALLSITE
+  })
 }
 
 function postBoundaryWeatherLineage(trace) {
@@ -227,7 +237,7 @@ function postBoundaryWeatherLineage(trace) {
 
   const entries = normalized
     .slice(boundaryIndex + 1)
-    .filter((entry) => entry.sampleCallSite.startsWith('updateAtmosphere:'))
+    .filter((entry) => entry.sampleCallSite.startsWith('updateAtmosphere:') || entry.sampleCallSite.startsWith('engine:startup-'))
     .filter((entry) => entry.engineFrame <= 3)
 
   return { boundaryIndex, entries, boundaryEntry: normalized[boundaryIndex] }

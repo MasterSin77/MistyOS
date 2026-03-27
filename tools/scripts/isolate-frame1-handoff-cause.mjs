@@ -12,6 +12,9 @@ const DETERMINISTIC_SEED = Number(process.env.MISTYOS_DETERMINISTIC_SEED || 1337
 const BOOT_TIMEOUT_MS = Number(process.env.MISTYOS_BOOT_TIMEOUT_MS || 20000)
 const FLOAT_EPSILON = Number(process.env.MISTYOS_FLOAT_EPSILON || 1e-12)
 const NON_DETERMINISTIC_CALLSITE = 'updateAtmosphere:getPresentationTimeSec'
+const ENGINE_STEADY_LIVE_CALLSITE = 'engine:steady-live-scheduler-sample'
+const ENGINE_STARTUP_BOUNDARY_CALLSITE = 'engine:startup-first-live-boundary'
+const ENGINE_STARTUP_SYNC_CALLSITE = 'engine:startup-frame-sync'
 
 function fail(details) {
   throw new Error(JSON.stringify({ ok: false, ...details }, null, 2))
@@ -44,9 +47,30 @@ function isWallClockDrivenCallSite(callSite) {
   return String(callSite || '') === NON_DETERMINISTIC_CALLSITE
 }
 
+function isExpectedTimingVariantCallSite(callSite) {
+  const value = String(callSite || '')
+  return (
+    value === NON_DETERMINISTIC_CALLSITE ||
+    value === 'updateAtmosphere:startup-frame-sync' ||
+    value === ENGINE_STARTUP_SYNC_CALLSITE ||
+    value === ENGINE_STEADY_LIVE_CALLSITE
+  )
+}
+
 function isExpectedStartupLiveBoundaryCallSite(callSite) {
   const value = String(callSite || '')
-  return value === 'updateAtmosphere:startup-frame-sync' || value === NON_DETERMINISTIC_CALLSITE
+  return (
+    value === 'updateAtmosphere:startup-frame-sync' ||
+    value === ENGINE_STARTUP_BOUNDARY_CALLSITE ||
+    value === ENGINE_STARTUP_SYNC_CALLSITE ||
+    value === NON_DETERMINISTIC_CALLSITE ||
+    value === ENGINE_STEADY_LIVE_CALLSITE
+  )
+}
+
+function isExpectedPostBoundaryCallSite(callSite) {
+  const value = String(callSite || '')
+  return value.startsWith('updateAtmosphere:') || value.startsWith('engine:startup-') || value === ENGINE_STEADY_LIVE_CALLSITE
 }
 
 async function addDeterministicSeedScript(context, seed) {
@@ -137,8 +161,14 @@ async function captureMode(page, mode) {
     const bootstrap = stats?.bootstrap || {}
     const frames = Array.isArray(bootstrap.initialFrameDiagnostics) ? bootstrap.initialFrameDiagnostics : []
     const lineage = Array.isArray(bootstrap.setTuningLineageTrace) ? bootstrap.setTuningLineageTrace : []
-    const boundaryIndex = lineage.findIndex((entry) => entry?.sampleCallSite === 'onStats:startup-first-live-boundary')
-    const hasPostBoundary = boundaryIndex >= 0 && lineage.slice(boundaryIndex + 1).some((entry) => String(entry?.sampleCallSite || '').startsWith('updateAtmosphere:'))
+    const boundaryIndex = lineage.findIndex((entry) => {
+      const sampleCallSite = String(entry?.sampleCallSite || '')
+      return sampleCallSite === 'onStats:startup-first-live-boundary' || sampleCallSite === 'engine:startup-first-live-boundary'
+    })
+    const hasPostBoundary = boundaryIndex >= 0 && lineage.slice(boundaryIndex + 1).some((entry) => {
+      const sampleCallSite = String(entry?.sampleCallSite || '')
+      return sampleCallSite.startsWith('updateAtmosphere:') || sampleCallSite.startsWith('engine:startup-') || sampleCallSite === 'engine:steady-live-scheduler-sample'
+    })
     return frames.length >= 3 && hasPostBoundary
   }, undefined, { timeout: BOOT_TIMEOUT_MS })
 
@@ -156,12 +186,15 @@ async function captureMode(page, mode) {
   })
 
   const lineage = Array.isArray(payload?.lineage) ? payload.lineage : []
-  const boundaryIndex = lineage.findIndex((entry) => entry?.sampleCallSite === 'onStats:startup-first-live-boundary')
+  const boundaryIndex = lineage.findIndex((entry) => {
+    const sampleCallSite = String(entry?.sampleCallSite || '')
+    return sampleCallSite === 'onStats:startup-first-live-boundary' || sampleCallSite === ENGINE_STARTUP_BOUNDARY_CALLSITE
+  })
   const boundary = boundaryIndex >= 0 ? normalizeLineageEntry(lineage[boundaryIndex]) : null
   const postBoundaryEntries = boundaryIndex >= 0
     ? lineage
       .slice(boundaryIndex + 1)
-      .filter((entry) => String(entry?.sampleCallSite || '').startsWith('updateAtmosphere:'))
+      .filter((entry) => isExpectedPostBoundaryCallSite(entry?.sampleCallSite))
       .map((entry) => normalizeLineageEntry(entry))
     : []
   const firstLivePostBoundary = postBoundaryEntries[0] || null
@@ -300,7 +333,7 @@ async function main() {
       }
     }
 
-    const containsWallClockDrivenSample = isWallClockDrivenCallSite(publishSample.sampleCallSite) || isWallClockDrivenCallSite(coldSample.sampleCallSite)
+    const containsWallClockDrivenSample = isExpectedTimingVariantCallSite(publishSample.sampleCallSite) || isExpectedTimingVariantCallSite(coldSample.sampleCallSite)
     if (containsWallClockDrivenSample) {
       harnessDrift.push({
         factor: 'post-boundary-wall-clock-sample-time',
