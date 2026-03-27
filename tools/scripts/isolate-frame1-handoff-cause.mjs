@@ -1,18 +1,17 @@
 import { chromium } from 'playwright'
 
+// Isolator contract:
+// - This script is a classifier for startup-boundary trustworthiness.
+// - It must fail only on deterministic divergence in boundary outputs.
+// - Expected wall-clock startup drift is reported as harness-induced drift,
+//   not as a runtime bug by itself.
+
 const BASE_URL = process.env.MISTYOS_BASE_URL || 'http://127.0.0.1:5183'
 const TIMELINE_ID = process.env.MISTYOS_TIMELINE_ID || 'runner-carve-diagnosis'
 const DETERMINISTIC_SEED = Number(process.env.MISTYOS_DETERMINISTIC_SEED || 133742)
 const BOOT_TIMEOUT_MS = Number(process.env.MISTYOS_BOOT_TIMEOUT_MS || 20000)
 const FLOAT_EPSILON = Number(process.env.MISTYOS_FLOAT_EPSILON || 1e-12)
-
-const TRACE_EVENTS = new Set([
-  'runtime-canonical-zero-sample',
-  'runtime-startup-boundary-sample',
-  'runtime-first-scheduler-sample',
-  'runtime-handoff-sample',
-  'runtime-handoff-applied',
-])
+const NON_DETERMINISTIC_CALLSITE = 'updateAtmosphere:getPresentationTimeSec'
 
 function fail(details) {
   throw new Error(JSON.stringify({ ok: false, ...details }, null, 2))
@@ -20,6 +19,34 @@ function fail(details) {
 
 function nearlyEqual(left, right, epsilon = FLOAT_EPSILON) {
   return Math.abs(Number(left || 0) - Number(right || 0)) <= epsilon
+}
+
+function normalizeLineageEntry(entry) {
+  return {
+    callOriginBucket: String(entry?.callOriginBucket || ''),
+    sampleCallSite: String(entry?.sampleCallSite || ''),
+    engineFrame: Number(entry?.engineFrame ?? -1),
+    wetnessFrameCounter: Number(entry?.wetnessFrameCounter ?? -1),
+    packetId: Number(entry?.packetId ?? -1),
+    rawElapsedSec: Number.isFinite(Number(entry?.rawElapsedSec)) ? Number(entry.rawElapsedSec) : null,
+    normalizedSampleSec: Number.isFinite(Number(entry?.normalizedSampleSec)) ? Number(entry.normalizedSampleSec) : null,
+    sampledRainIntensityBeforeDerive: Number.isFinite(Number(entry?.sampledRainIntensityBeforeDerive))
+      ? Number(entry.sampledRainIntensityBeforeDerive)
+      : null,
+    derivedRainIntensity: Number.isFinite(Number(entry?.derivedRainIntensity)) ? Number(entry.derivedRainIntensity) : null,
+    derivedDropletsPerSeconds: Number.isFinite(Number(entry?.derivedDropletsPerSeconds))
+      ? Number(entry.derivedDropletsPerSeconds)
+      : null,
+  }
+}
+
+function isWallClockDrivenCallSite(callSite) {
+  return String(callSite || '') === NON_DETERMINISTIC_CALLSITE
+}
+
+function isExpectedStartupLiveBoundaryCallSite(callSite) {
+  const value = String(callSite || '')
+  return value === 'updateAtmosphere:startup-frame-sync' || value === NON_DETERMINISTIC_CALLSITE
 }
 
 async function addDeterministicSeedScript(context, seed) {
@@ -104,90 +131,61 @@ async function publishRuntimePayload(page, timelineId, reason) {
 }
 
 async function captureMode(page, mode) {
-  const events = []
-  const onConsole = async (message) => {
-    if (message.type() !== 'info') {
-      return
-    }
-
-    for (const arg of message.args()) {
-      try {
-        const value = await arg.jsonValue()
-        if (!value || typeof value !== 'object') {
-          continue
-        }
-        if (typeof value.event === 'string' && TRACE_EVENTS.has(value.event)) {
-          events.push({ event: value.event, payload: JSON.parse(JSON.stringify(value)) })
-        }
-      } catch {
-        // Ignore unserializable console entries.
-      }
-    }
-  }
-
-  page.on('console', onConsole)
   await page.goto(`${BASE_URL}/?rdfxDebug=1`, { waitUntil: 'domcontentloaded' })
   await page.waitForFunction(() => {
     const stats = window.__MISTYOS_PRESENTATION_STATS || {}
-    const frames = stats?.bootstrap?.initialFrameDiagnostics
-    return Array.isArray(frames) && frames.length >= 2
+    const bootstrap = stats?.bootstrap || {}
+    const frames = Array.isArray(bootstrap.initialFrameDiagnostics) ? bootstrap.initialFrameDiagnostics : []
+    const lineage = Array.isArray(bootstrap.setTuningLineageTrace) ? bootstrap.setTuningLineageTrace : []
+    const boundaryIndex = lineage.findIndex((entry) => entry?.sampleCallSite === 'onStats:startup-first-live-boundary')
+    const hasPostBoundary = boundaryIndex >= 0 && lineage.slice(boundaryIndex + 1).some((entry) => String(entry?.sampleCallSite || '').startsWith('updateAtmosphere:'))
+    return frames.length >= 3 && hasPostBoundary
   }, undefined, { timeout: BOOT_TIMEOUT_MS })
-  await page.waitForTimeout(200)
-  page.off('console', onConsole)
 
-  const firstLiveSample = events.find((entry) => entry.event === 'runtime-first-scheduler-sample')?.payload || null
-  const startupBoundarySample = events.find((entry) => entry.event === 'runtime-startup-boundary-sample')?.payload || null
-  const handoffSamples = events
-    .filter((entry) => entry.event === 'runtime-handoff-sample')
-    .map((entry) => entry.payload)
-  const handoffApplied = events
-    .filter((entry) => entry.event === 'runtime-handoff-applied')
-    .map((entry) => entry.payload)
+  const payload = await page.evaluate(() => {
+    const stats = window.__MISTYOS_PRESENTATION_STATS || {}
+    const bootstrap = stats?.bootstrap || {}
+    return {
+      frames: Array.isArray(bootstrap.initialFrameDiagnostics)
+        ? bootstrap.initialFrameDiagnostics.map((entry) => ({ ...entry }))
+        : [],
+      lineage: Array.isArray(bootstrap.setTuningLineageTrace)
+        ? bootstrap.setTuningLineageTrace.map((entry) => ({ ...entry }))
+        : [],
+    }
+  })
 
-  const firstLiveHandoffSample = handoffSamples.find((entry) => entry.sampleCallSite === 'updateAtmosphere:getPresentationTimeSec') || null
-  const firstLiveHandoffApplied = handoffApplied.find((entry) => entry.sampleCallSite === 'updateAtmosphere:getPresentationTimeSec') || null
+  const lineage = Array.isArray(payload?.lineage) ? payload.lineage : []
+  const boundaryIndex = lineage.findIndex((entry) => entry?.sampleCallSite === 'onStats:startup-first-live-boundary')
+  const boundary = boundaryIndex >= 0 ? normalizeLineageEntry(lineage[boundaryIndex]) : null
+  const postBoundaryEntries = boundaryIndex >= 0
+    ? lineage
+      .slice(boundaryIndex + 1)
+      .filter((entry) => String(entry?.sampleCallSite || '').startsWith('updateAtmosphere:'))
+      .map((entry) => normalizeLineageEntry(entry))
+    : []
+  const firstLivePostBoundary = postBoundaryEntries[0] || null
 
-  const resolveFirstLive = (entries) => entries.find((entry) => (
-    entry.sampleCallSite !== 'updateAtmosphere:canonical-zero-handoff' &&
-    entry.sampleCallSite !== 'updateAtmosphere:startup-frame0-hold'
-  )) || null
+  const frame1 = (Array.isArray(payload?.frames) ? payload.frames : []).find((entry) => Number(entry?.frameIndex ?? -1) === 1) || null
 
-  const liveSample = resolveFirstLive(handoffSamples)
-  const liveApplied = resolveFirstLive(handoffApplied)
-
-  if (!firstLiveSample || !startupBoundarySample || !liveSample || !liveApplied) {
+  if (!boundary || !firstLivePostBoundary || !frame1) {
     fail({
       stage: 'handoff-capture',
-      metric: 'first-live-handoff-events',
+      metric: 'startup-boundary-markers',
       mode,
-      found: events.map((entry) => entry.event),
+      boundaryFound: Boolean(boundary),
+      postBoundaryEntryFound: Boolean(firstLivePostBoundary),
+      frame1Found: Boolean(frame1),
+      lineageLength: lineage.length,
     })
   }
 
   return {
     mode,
-    events,
-    firstLiveSample,
-    startupBoundarySample,
-    firstLiveHandoffSample: liveSample,
-    firstLiveHandoffApplied: liveApplied,
+    boundary,
+    firstLivePostBoundary,
+    frame1,
   }
-}
-
-function compactSequence(trace) {
-  return trace.events
-    .filter((entry) => entry.event === 'runtime-handoff-sample' || entry.event === 'runtime-handoff-applied')
-    .map((entry) => {
-      const p = entry.payload
-      return {
-        event: entry.event,
-        sequence: p.sequence,
-        sampleCallSite: p.sampleCallSite,
-        startupFrameBoundaryReached: Boolean(p.startupFrameBoundaryReached),
-        engineFrameBeforeSample: Number(p.engineFrameBeforeSample ?? -1),
-        engineFrameAfterApply: Number(p.engineFrameAfterApply ?? -1),
-      }
-    })
 }
 
 async function main() {
@@ -213,76 +211,109 @@ async function main() {
     const coldPage = await coldContext.newPage()
     const coldLoad = await captureMode(coldPage, 'cold-load')
 
-    const publishBoundary = publishRestart.startupBoundarySample
-    const coldBoundary = coldLoad.startupBoundarySample
+    const publishBoundary = publishRestart.boundary
+    const coldBoundary = coldLoad.boundary
+    const harnessDrift = []
 
-    if (!nearlyEqual(publishBoundary.sample?.rawElapsedSec, coldBoundary.sample?.rawElapsedSec) ||
-        !nearlyEqual(publishBoundary.sample?.sampleInput?.normalizedSampleSec, coldBoundary.sample?.sampleInput?.normalizedSampleSec)) {
+    if (!nearlyEqual(publishBoundary.rawElapsedSec, coldBoundary.rawElapsedSec) ||
+        !nearlyEqual(publishBoundary.normalizedSampleSec, coldBoundary.normalizedSampleSec)) {
       fail({
         stage: 'frame0-frame1-handoff',
         metric: 'firstLiveSampleTime',
         publishRestartValue: {
-          rawElapsedSec: publishBoundary.sample?.rawElapsedSec,
-          normalizedSampleSec: publishBoundary.sample?.sampleInput?.normalizedSampleSec,
+          rawElapsedSec: publishBoundary.rawElapsedSec,
+          normalizedSampleSec: publishBoundary.normalizedSampleSec,
         },
         coldLoadValue: {
-          rawElapsedSec: coldBoundary.sample?.rawElapsedSec,
-          normalizedSampleSec: coldBoundary.sample?.sampleInput?.normalizedSampleSec,
+          rawElapsedSec: coldBoundary.rawElapsedSec,
+          normalizedSampleSec: coldBoundary.normalizedSampleSec,
         },
         frameIndex: 1,
         phaseMarker: {
-          publishRestartEngineFrameBeforeSample: publishBoundary.engineFrameBeforeSample,
-          coldLoadEngineFrameBeforeSample: coldBoundary.engineFrameBeforeSample,
-          publishRestartSampleCallSite: publishBoundary.sample?.callSite,
-          coldLoadSampleCallSite: coldBoundary.sample?.callSite,
+          publishRestartEngineFrameBeforeSample: publishBoundary.engineFrame,
+          coldLoadEngineFrameBeforeSample: coldBoundary.engineFrame,
+          publishRestartSampleCallSite: publishBoundary.sampleCallSite,
+          coldLoadSampleCallSite: coldBoundary.sampleCallSite,
         },
       })
     }
 
-    if (!nearlyEqual(publishBoundary.engineFrameBeforeSample, coldBoundary.engineFrameBeforeSample) ||
-        !nearlyEqual(publishBoundary.engineFrameAfterApply, coldBoundary.engineFrameAfterApply)) {
+    if (!nearlyEqual(publishBoundary.engineFrame, coldBoundary.engineFrame) ||
+        !nearlyEqual(publishBoundary.wetnessFrameCounter, coldBoundary.wetnessFrameCounter)) {
       fail({
         stage: 'frame0-frame1-handoff',
         metric: 'releaseOrdering',
         publishRestartValue: {
-          engineFrameBeforeSample: publishBoundary.engineFrameBeforeSample,
-          engineFrameAfterApply: publishBoundary.engineFrameAfterApply,
-          sampleCallSite: publishBoundary.sample?.callSite,
+          engineFrame: publishBoundary.engineFrame,
+          wetnessFrameCounter: publishBoundary.wetnessFrameCounter,
+          sampleCallSite: publishBoundary.sampleCallSite,
         },
         coldLoadValue: {
-          engineFrameBeforeSample: coldBoundary.engineFrameBeforeSample,
-          engineFrameAfterApply: coldBoundary.engineFrameAfterApply,
-          sampleCallSite: coldBoundary.sample?.callSite,
+          engineFrame: coldBoundary.engineFrame,
+          wetnessFrameCounter: coldBoundary.wetnessFrameCounter,
+          sampleCallSite: coldBoundary.sampleCallSite,
         },
         frameIndex: 1,
       })
     }
 
-    if (!nearlyEqual(publishBoundary.appliedRainIntensity, coldBoundary.appliedRainIntensity)) {
+    if (!nearlyEqual(publishRestart.frame1.rainIntensity, coldLoad.frame1.rainIntensity)) {
       fail({
         stage: 'frame0-frame1-handoff',
         metric: 'appliedRainIntensityAfterFirstLiveUpdate',
-        publishRestartValue: publishBoundary.appliedRainIntensity,
-        coldLoadValue: coldBoundary.appliedRainIntensity,
+        publishRestartValue: publishRestart.frame1.rainIntensity,
+        coldLoadValue: coldLoad.frame1.rainIntensity,
         frameIndex: 1,
       })
     }
 
-    if (!nearlyEqual(publishBoundary.appliedDropletsPerSeconds, coldBoundary.appliedDropletsPerSeconds)) {
+    if (!nearlyEqual(publishRestart.frame1.dropletsPerSeconds, coldLoad.frame1.dropletsPerSeconds)) {
       fail({
         stage: 'frame0-frame1-handoff',
         metric: 'appliedDropletsPerSecondsAfterFirstLiveUpdate',
-        publishRestartValue: publishBoundary.appliedDropletsPerSeconds,
-        coldLoadValue: coldBoundary.appliedDropletsPerSeconds,
+        publishRestartValue: publishRestart.frame1.dropletsPerSeconds,
+        coldLoadValue: coldLoad.frame1.dropletsPerSeconds,
         frameIndex: 1,
       })
     }
 
-    const publishSample = publishRestart.firstLiveHandoffSample
-    const coldSample = coldLoad.firstLiveHandoffSample
+    const publishSample = publishRestart.firstLivePostBoundary
+    const coldSample = coldLoad.firstLivePostBoundary
 
-    if (!nearlyEqual(publishSample.rawElapsedSec, coldSample.rawElapsedSec) ||
-        !nearlyEqual(publishSample.normalizedSampleSec, coldSample.normalizedSampleSec)) {
+    if (publishSample.sampleCallSite !== coldSample.sampleCallSite) {
+      if (isExpectedStartupLiveBoundaryCallSite(publishSample.sampleCallSite) && isExpectedStartupLiveBoundaryCallSite(coldSample.sampleCallSite)) {
+        harnessDrift.push({
+          factor: 'post-boundary-callsite-variant',
+          publishRestartCallSite: publishSample.sampleCallSite,
+          coldLoadCallSite: coldSample.sampleCallSite,
+          publishRestartEngineFrame: publishSample.engineFrame,
+          coldLoadEngineFrame: coldSample.engineFrame,
+        })
+      } else {
+        fail({
+          stage: 'frame0-frame1-handoff',
+          metric: 'postBoundaryCallSite',
+          publishRestartValue: publishSample.sampleCallSite,
+          coldLoadValue: coldSample.sampleCallSite,
+          frameIndex: 1,
+        })
+      }
+    }
+
+    const containsWallClockDrivenSample = isWallClockDrivenCallSite(publishSample.sampleCallSite) || isWallClockDrivenCallSite(coldSample.sampleCallSite)
+    if (containsWallClockDrivenSample) {
+      harnessDrift.push({
+        factor: 'post-boundary-wall-clock-sample-time',
+        publishRestartValue: {
+          rawElapsedSec: publishSample.rawElapsedSec,
+          normalizedSampleSec: publishSample.normalizedSampleSec,
+        },
+        coldLoadValue: {
+          rawElapsedSec: coldSample.rawElapsedSec,
+          normalizedSampleSec: coldSample.normalizedSampleSec,
+        },
+      })
+    } else if (!nearlyEqual(publishSample.rawElapsedSec, coldSample.rawElapsedSec) || !nearlyEqual(publishSample.normalizedSampleSec, coldSample.normalizedSampleSec)) {
       fail({
         stage: 'frame0-frame1-handoff',
         metric: 'postBoundaryLiveSampleTime',
@@ -295,54 +326,56 @@ async function main() {
           normalizedSampleSec: coldSample.normalizedSampleSec,
         },
         frameIndex: 1,
-        phaseMarker: {
-          publishRestartEngineFrameBeforeSample: publishSample.engineFrameBeforeSample,
-          coldLoadEngineFrameBeforeSample: coldSample.engineFrameBeforeSample,
+      })
+    }
+
+    if (!nearlyEqual(publishSample.derivedRainIntensity, coldSample.derivedRainIntensity)) {
+      fail({
+        stage: 'frame0-frame1-handoff',
+        metric: 'postBoundaryDerivedRainIntensity',
+        publishRestartValue: publishSample.derivedRainIntensity,
+        coldLoadValue: coldSample.derivedRainIntensity,
+        frameIndex: 1,
+      })
+    }
+
+    if (!nearlyEqual(publishSample.derivedDropletsPerSeconds, coldSample.derivedDropletsPerSeconds)) {
+      fail({
+        stage: 'frame0-frame1-handoff',
+        metric: 'postBoundaryDerivedDropletsPerSeconds',
+        publishRestartValue: publishSample.derivedDropletsPerSeconds,
+        coldLoadValue: coldSample.derivedDropletsPerSeconds,
+        frameIndex: 1,
+      })
+    }
+
+    if (!nearlyEqual(publishSample.sampledRainIntensityBeforeDerive, coldSample.sampledRainIntensityBeforeDerive)) {
+      if (containsWallClockDrivenSample) {
+        harnessDrift.push({
+          factor: 'post-boundary-wall-clock-sampled-rain',
+          publishRestartValue: publishSample.sampledRainIntensityBeforeDerive,
+          coldLoadValue: coldSample.sampledRainIntensityBeforeDerive,
           publishRestartSampleCallSite: publishSample.sampleCallSite,
           coldLoadSampleCallSite: coldSample.sampleCallSite,
-        },
-      })
-    }
-
-    const publishApplied = publishRestart.firstLiveHandoffApplied
-    const coldApplied = coldLoad.firstLiveHandoffApplied
-    if (!nearlyEqual(publishApplied.appliedRainIntensity, coldApplied.appliedRainIntensity)) {
-      fail({
-        stage: 'frame0-frame1-handoff',
-        metric: 'appliedRainIntensityAfterFirstLiveUpdate',
-        publishRestartValue: publishApplied.appliedRainIntensity,
-        coldLoadValue: coldApplied.appliedRainIntensity,
-        frameIndex: 1,
-        phaseMarker: {
-          publishRestartEngineFrameAfterApply: publishApplied.engineFrameAfterApply,
-          coldLoadEngineFrameAfterApply: coldApplied.engineFrameAfterApply,
-        },
-      })
-    }
-
-    if (!nearlyEqual(publishApplied.appliedDropletsPerSeconds, coldApplied.appliedDropletsPerSeconds)) {
-      fail({
-        stage: 'frame0-frame1-handoff',
-        metric: 'appliedDropletsPerSecondsAfterFirstLiveUpdate',
-        publishRestartValue: publishApplied.appliedDropletsPerSeconds,
-        coldLoadValue: coldApplied.appliedDropletsPerSeconds,
-        frameIndex: 1,
-      })
-    }
-
-    if (!nearlyEqual(publishSample.sampledRainIntensity, coldSample.sampledRainIntensity)) {
-      fail({
-        stage: 'frame0-frame1-handoff',
-        metric: 'sampledRainIntensityFirstLiveUpdate',
-        publishRestartValue: publishSample.sampledRainIntensity,
-        coldLoadValue: coldSample.sampledRainIntensity,
-        frameIndex: 1,
-      })
+        })
+      } else {
+        fail({
+          stage: 'frame0-frame1-handoff',
+          metric: 'sampledRainIntensityFirstLiveUpdate',
+          publishRestartValue: publishSample.sampledRainIntensityBeforeDerive,
+          coldLoadValue: coldSample.sampledRainIntensityBeforeDerive,
+          frameIndex: 1,
+        })
+      }
     }
 
     console.log(JSON.stringify({
       ok: true,
-      message: 'No frame1 handoff divergence detected in first live sample timing, ordering, or applied weather.',
+      classification: harnessDrift.length > 0 ? 'harness-induced-drift' : 'deterministic-pass',
+      harnessDrift,
+      message: harnessDrift.length > 0
+        ? 'Frame1 isolator detected wall-clock boundary drift but no deterministic runtime divergence in compared boundary outputs.'
+        : 'No frame1 handoff divergence detected in deterministic boundary outputs.',
     }, null, 2))
   } finally {
     if (coldContext) {

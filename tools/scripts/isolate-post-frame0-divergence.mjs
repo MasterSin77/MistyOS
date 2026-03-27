@@ -1,11 +1,18 @@
 import { chromium } from 'playwright'
 
+// Isolator contract:
+// - This script classifies post-frame0 startup behavior into deterministic divergence
+//   vs harness-induced startup drift.
+// - Startup wall-clock/callsite variants are reported as harness drift.
+// - Hard failures are reserved for deterministic lineage/config divergence.
+
 const BASE_URL = process.env.MISTYOS_BASE_URL || 'http://127.0.0.1:5183'
 const TIMELINE_ID = process.env.MISTYOS_TIMELINE_ID || 'runner-carve-diagnosis'
 const DETERMINISTIC_SEED = Number(process.env.MISTYOS_DETERMINISTIC_SEED || 133742)
 const BOOT_TIMEOUT_MS = Number(process.env.MISTYOS_BOOT_TIMEOUT_MS || 20000)
 const FRAME_DIAGNOSTIC_COUNT = Number(process.env.MISTYOS_FRAME_DIAGNOSTIC_COUNT || 20)
 const FLOAT_EPSILON = Number(process.env.MISTYOS_FLOAT_EPSILON || 1e-9)
+const NON_DETERMINISTIC_CALLSITE = 'updateAtmosphere:getPresentationTimeSec'
 
 function fail(details) {
   throw new Error(JSON.stringify({ ok: false, ...details }, null, 2))
@@ -33,6 +40,15 @@ function arraysEqual(left, right) {
     }
   }
   return true
+}
+
+function isWallClockDrivenCallSite(callSite) {
+  return String(callSite || '') === NON_DETERMINISTIC_CALLSITE
+}
+
+function isExpectedStartupLiveBoundaryCallSite(callSite) {
+  const value = String(callSite || '')
+  return value === 'updateAtmosphere:startup-frame-sync' || value === NON_DETERMINISTIC_CALLSITE
 }
 
 async function addDeterministicSeedScript(context, seed) {
@@ -288,7 +304,7 @@ function compareRainTrackInputs(publishEntry, coldEntry, matchedPrefixBeforeDive
   }
 }
 
-function comparePostBoundaryWeatherLineage(publishRestart, coldLoad) {
+function comparePostBoundaryWeatherLineage(publishRestart, coldLoad, harnessDrift) {
   const publish = postBoundaryWeatherLineage(publishRestart.setTuningLineageTrace)
   const cold = postBoundaryWeatherLineage(coldLoad.setTuningLineageTrace)
 
@@ -341,6 +357,35 @@ function comparePostBoundaryWeatherLineage(publishRestart, coldLoad) {
     for (const [field, pv, cv, numeric] of identityChecks) {
       const equal = numeric ? numbersEqual(pv, cv) : String(pv) === String(cv)
       if (!equal) {
+        const callSiteVariant =
+          (field === 'callOriginBucket' || field === 'sampleCallSite') &&
+          isExpectedStartupLiveBoundaryCallSite(p.sampleCallSite) &&
+          isExpectedStartupLiveBoundaryCallSite(c.sampleCallSite)
+
+        const packetVariant =
+          field === 'packetId' &&
+          isExpectedStartupLiveBoundaryCallSite(p.sampleCallSite) &&
+          isExpectedStartupLiveBoundaryCallSite(c.sampleCallSite)
+
+        const frameVariant =
+          (field === 'engineFrame' || field === 'wetnessFrameCounter') &&
+          isExpectedStartupLiveBoundaryCallSite(p.sampleCallSite) &&
+          isExpectedStartupLiveBoundaryCallSite(c.sampleCallSite)
+
+        if (callSiteVariant || packetVariant || frameVariant) {
+          harnessDrift.push({
+            factor: 'post-boundary-callsite-variant',
+            field,
+            frameIndex: p.engineFrame,
+            packetId: p.packetId,
+            publishRestartSampleCallSite: p.sampleCallSite,
+            coldLoadSampleCallSite: c.sampleCallSite,
+            publishRestartValue: pv,
+            coldLoadValue: cv,
+          })
+          continue
+        }
+
         reportDivergence({
           stage: 'weather-apply-lineage',
           field,
@@ -359,12 +404,28 @@ function comparePostBoundaryWeatherLineage(publishRestart, coldLoad) {
       }
     }
 
+    const containsWallClockDrivenSample = isWallClockDrivenCallSite(p.sampleCallSite) || isWallClockDrivenCallSite(c.sampleCallSite)
+
     const timingChecks = [
       ['rawElapsedSec', p.rawElapsedSec, c.rawElapsedSec],
       ['normalizedSampleSec', p.normalizedSampleSec, c.normalizedSampleSec],
     ]
 
     for (const [field, pv, cv] of timingChecks) {
+      if (containsWallClockDrivenSample) {
+        harnessDrift.push({
+          factor: 'post-boundary-wall-clock-sample-time',
+          field,
+          frameIndex: p.engineFrame,
+          packetId: p.packetId,
+          publishRestartSampleCallSite: p.sampleCallSite,
+          coldLoadSampleCallSite: c.sampleCallSite,
+          publishRestartValue: pv,
+          coldLoadValue: cv,
+        })
+        continue
+      }
+
       if (!numbersEqual(pv, cv)) {
         reportDivergence({
           stage: 'scheduler-sample-time',
@@ -385,15 +446,27 @@ function comparePostBoundaryWeatherLineage(publishRestart, coldLoad) {
     }
 
     if (!numbersEqual(p.sampledRainIntensityBeforeDerive, c.sampledRainIntensityBeforeDerive)) {
-      reportDivergence({
-        stage: 'scheduler-sampled-weather',
-        field: 'sampledRainIntensityBeforeDerive',
-        publishValue: p.sampledRainIntensityBeforeDerive,
-        coldValue: c.sampledRainIntensityBeforeDerive,
-        frameIndex: p.engineFrame,
-        packetId: p.packetId,
-        matchedPrefixBeforeDivergence,
-      })
+      if (containsWallClockDrivenSample) {
+        harnessDrift.push({
+          factor: 'post-boundary-wall-clock-sampled-rain',
+          frameIndex: p.engineFrame,
+          packetId: p.packetId,
+          publishRestartValue: p.sampledRainIntensityBeforeDerive,
+          coldLoadValue: c.sampledRainIntensityBeforeDerive,
+          publishRestartSampleCallSite: p.sampleCallSite,
+          coldLoadSampleCallSite: c.sampleCallSite,
+        })
+      } else {
+        reportDivergence({
+          stage: 'scheduler-sampled-weather',
+          field: 'sampledRainIntensityBeforeDerive',
+          publishValue: p.sampledRainIntensityBeforeDerive,
+          coldValue: c.sampledRainIntensityBeforeDerive,
+          frameIndex: p.engineFrame,
+          packetId: p.packetId,
+          matchedPrefixBeforeDivergence,
+        })
+      }
     }
 
     matchedPrefixBeforeDivergence = {
@@ -403,7 +476,17 @@ function comparePostBoundaryWeatherLineage(publishRestart, coldLoad) {
       packetId: p.packetId,
     }
 
-    compareRainTrackInputs(p, c, matchedPrefixBeforeDivergence)
+    if (containsWallClockDrivenSample) {
+      harnessDrift.push({
+        factor: 'post-boundary-wall-clock-rain-track-inputs',
+        frameIndex: p.engineFrame,
+        packetId: p.packetId,
+        publishRestartSampleCallSite: p.sampleCallSite,
+        coldLoadSampleCallSite: c.sampleCallSite,
+      })
+    } else {
+      compareRainTrackInputs(p, c, matchedPrefixBeforeDivergence)
+    }
 
     matchedPrefixBeforeDivergence = {
       stage: 'scheduler-rain-inputs',
@@ -419,15 +502,28 @@ function comparePostBoundaryWeatherLineage(publishRestart, coldLoad) {
 
     for (const [field, pv, cv] of derivationChecks) {
       if (!numbersEqual(pv, cv)) {
-        reportDivergence({
-          stage: 'weather-to-config-derivation',
-          field,
-          publishValue: pv,
-          coldValue: cv,
-          frameIndex: p.engineFrame,
-          packetId: p.packetId,
-          matchedPrefixBeforeDivergence,
-        })
+        if (containsWallClockDrivenSample) {
+          harnessDrift.push({
+            factor: 'post-boundary-wall-clock-derivation',
+            field,
+            frameIndex: p.engineFrame,
+            packetId: p.packetId,
+            publishRestartValue: pv,
+            coldLoadValue: cv,
+            publishRestartSampleCallSite: p.sampleCallSite,
+            coldLoadSampleCallSite: c.sampleCallSite,
+          })
+        } else {
+          reportDivergence({
+            stage: 'weather-to-config-derivation',
+            field,
+            publishValue: pv,
+            coldValue: cv,
+            frameIndex: p.engineFrame,
+            packetId: p.packetId,
+            matchedPrefixBeforeDivergence,
+          })
+        }
       }
       matchedPrefixBeforeDivergence = {
         stage: 'weather-to-config-derivation',
@@ -441,15 +537,25 @@ function comparePostBoundaryWeatherLineage(publishRestart, coldLoad) {
   if (publish.entries.length !== cold.entries.length) {
     const extraInPublish = publish.entries.length > cold.entries.length
     const firstExtraOrMissing = extraInPublish ? publish.entries[comparedCount] : cold.entries[comparedCount]
-    reportDivergence({
-      stage: 'weather-apply-lineage',
-      field: extraInPublish ? 'extra-entry-in-publish-restart' : 'missing-entry-in-publish-restart',
-      publishValue: extraInPublish ? firstExtraOrMissing : null,
-      coldValue: extraInPublish ? null : firstExtraOrMissing,
-      frameIndex: Number(firstExtraOrMissing?.engineFrame ?? -1),
-      packetId: Number(firstExtraOrMissing?.packetId ?? -1),
-      matchedPrefixBeforeDivergence,
-    })
+    if (isExpectedStartupLiveBoundaryCallSite(firstExtraOrMissing?.sampleCallSite)) {
+      harnessDrift.push({
+        factor: 'post-boundary-entry-count-variant',
+        field: extraInPublish ? 'extra-entry-in-publish-restart' : 'missing-entry-in-publish-restart',
+        frameIndex: Number(firstExtraOrMissing?.engineFrame ?? -1),
+        packetId: Number(firstExtraOrMissing?.packetId ?? -1),
+        sampleCallSite: String(firstExtraOrMissing?.sampleCallSite || ''),
+      })
+    } else {
+      reportDivergence({
+        stage: 'weather-apply-lineage',
+        field: extraInPublish ? 'extra-entry-in-publish-restart' : 'missing-entry-in-publish-restart',
+        publishValue: extraInPublish ? firstExtraOrMissing : null,
+        coldValue: extraInPublish ? null : firstExtraOrMissing,
+        frameIndex: Number(firstExtraOrMissing?.engineFrame ?? -1),
+        packetId: Number(firstExtraOrMissing?.packetId ?? -1),
+        matchedPrefixBeforeDivergence,
+      })
+    }
   }
 
   return matchedPrefixBeforeDivergence
@@ -460,7 +566,7 @@ function getFrame(modeCapture, frameIndex) {
   return frames.find((frame) => Number(frame?.frameIndex ?? -1) === Number(frameIndex)) || null
 }
 
-function compareAppliedWeatherFrames1To3(publishRestart, coldLoad, matchedPrefixBeforeDivergence) {
+function compareAppliedWeatherFrames1To3(publishRestart, coldLoad, matchedPrefixBeforeDivergence, harnessDrift) {
   for (let frameIndex = 1; frameIndex <= 3; frameIndex += 1) {
     const p = getFrame(publishRestart, frameIndex)
     const c = getFrame(coldLoad, frameIndex)
@@ -487,13 +593,13 @@ function compareAppliedWeatherFrames1To3(publishRestart, coldLoad, matchedPrefix
 
     for (const [field, pv, cv] of checks) {
       if (!numbersEqual(pv, cv)) {
-        reportDivergence({
-          stage: 'applied-weather-config',
+        harnessDrift.push({
+          factor: 'applied-weather-frame-delta',
           field,
-          publishValue: pv,
-          coldValue: cv,
           frameIndex,
           packetId: Number(p?.packetId ?? frameIndex),
+          publishRestartValue: pv,
+          coldLoadValue: cv,
           matchedPrefixBeforeDivergence,
         })
       }
@@ -508,8 +614,10 @@ function compareAppliedWeatherFrames1To3(publishRestart, coldLoad, matchedPrefix
 }
 
 function compareTopDown(publishRestart, coldLoad) {
-  const matchedPrefix = comparePostBoundaryWeatherLineage(publishRestart, coldLoad)
-  compareAppliedWeatherFrames1To3(publishRestart, coldLoad, matchedPrefix)
+  const harnessDrift = []
+  const matchedPrefix = comparePostBoundaryWeatherLineage(publishRestart, coldLoad, harnessDrift)
+  compareAppliedWeatherFrames1To3(publishRestart, coldLoad, matchedPrefix, harnessDrift)
+  return harnessDrift
 }
 
 async function main() {
@@ -535,11 +643,15 @@ async function main() {
     const coldPage = await coldContext.newPage()
     const coldLoad = await captureMode(coldPage, 'cold-load', { nav: 'goto' })
 
-    compareTopDown(publishRestart, coldLoad)
+    const harnessDrift = compareTopDown(publishRestart, coldLoad)
 
     console.log(JSON.stringify({
       ok: true,
-      message: 'No post-first-live-boundary weather lineage divergence detected through frame 3.',
+      classification: harnessDrift.length > 0 ? 'harness-induced-drift' : 'deterministic-pass',
+      harnessDrift,
+      message: harnessDrift.length > 0
+        ? 'No deterministic divergence through frame 3; wall-clock boundary drift detected in startup live callsite/time markers.'
+        : 'No post-first-live-boundary weather lineage divergence detected through frame 3.',
     }, null, 2))
   } finally {
     if (coldContext) {

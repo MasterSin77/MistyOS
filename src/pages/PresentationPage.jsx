@@ -133,7 +133,7 @@ const resolveStartupPhaseTag = (sampleCallSite = '') => {
 }
 
   /**
-   * Shared Presentation bootstrap helper.
+   * Legacy Presentation bootstrap helper retained for diagnostics/fallback.
    *
    * Scans the scheduler for the first active rain window using a fine-grained step
    * (0.01 s) for the first 30 s, then a coarser 0.5 s step for the remainder.
@@ -144,8 +144,8 @@ const resolveStartupPhaseTag = (sampleCallSite = '') => {
    * Returns the first rain window time, the sampled weather there, and the
    * buildRuntimeWeatherDrivenConfig result ready to apply to the engine before start().
    *
-   * Called identically on every Presentation startup path (publish-restart and
-   * browser-refresh) so both paths prime the renderer with the same dropletsPerSeconds.
+  * Slice C moves canonical pre-start bootstrap ownership into the engine boundary.
+  * This helper remains available for scheduler-only diagnostics and defensive fallback.
    */
   function resolvePreStartBootstrapConfig(schedulerRuntime, basePreset, timelineDurationSec) {
     const empty = {
@@ -471,6 +471,13 @@ function PresentationPage() {
     clockAnchorMsRef.current = now
     clockOffsetSecRef.current = 0
     clockLockedSecRef.current = null
+    // Slice B scaffold plumbing: mirror Presentation reset into engine-owned clock seam.
+    // Presentation remains the active driver in this transitional pass.
+    engineRef.current?.resetSimulationClock?.({
+      reason,
+      startSec: 0,
+      nowMs: now,
+    })
     if (isDevRuntime()) {
       devLog('presentation-clock-reset', {
         reason,
@@ -499,6 +506,12 @@ function PresentationPage() {
       clockAnchorMsRef.current = now
     }
 
+    engineRef.current?.seekSimulationClock?.(clampedTargetSec, {
+      reason: options.reason || 'seek',
+      lockAtTarget: options.lockAtTarget === true,
+      nowMs: now,
+    })
+
     setClockDebug({
       mode: options.lockAtTarget ? 'locked' : 'running',
       lastAction: options.reason || 'seek',
@@ -507,11 +520,26 @@ function PresentationPage() {
   }, [timelineDurationSec])
 
   const getPresentationTimeSec = useCallback(() => {
+    const now = performance.now()
     if (Number.isFinite(clockLockedSecRef.current)) {
-      return clockLockedSecRef.current
+      const lockedSec = clockLockedSecRef.current
+      engineRef.current?.mirrorPresentationClockSample?.({
+        source: 'presentation-get-time',
+        callSite: 'getPresentationTimeSec:locked',
+        currentTimeSec: lockedSec,
+        nowMs: now,
+      })
+      return lockedSec
     }
-    const elapsedSec = Math.max(0, (performance.now() - clockAnchorMsRef.current) / 1000)
-    return Math.max(0, clockOffsetSecRef.current + elapsedSec)
+    const elapsedSec = Math.max(0, (now - clockAnchorMsRef.current) / 1000)
+    const currentSec = Math.max(0, clockOffsetSecRef.current + elapsedSec)
+    engineRef.current?.mirrorPresentationClockSample?.({
+      source: 'presentation-get-time',
+      callSite: 'getPresentationTimeSec:running',
+      currentTimeSec: currentSec,
+      nowMs: now,
+    })
+    return currentSec
   }, [])
 
   const findFirstActiveRainWindowSec = useCallback(() => {
@@ -749,7 +777,7 @@ function PresentationPage() {
           return
         }
 
-        activeEngine.stageTuningApplyTrace?.({
+        const startupTrace = {
           sampleCallSite: 'onStats:startup-first-live-boundary',
           sampleSequence: Number(tuningApplySequenceRef.current || 0),
           startupPhaseTag: 'first-live-boundary',
@@ -764,8 +792,24 @@ function PresentationPage() {
           derivedRainIntensity: Number(startupHintedConfig?.renderer?.rainIntensity || 0),
           derivedDropletsPerSeconds: Number(startupHintedConfig?.renderer?.dropletsPerSeconds || 0),
           rainTrackInputs: summarizeRainTrackInputs(startupSnapshot),
+        }
+        activeEngine.enqueueRuntimeInputEnvelope?.({
+          source: 'presentation:onStats:startup-first-live-boundary',
+          phaseTag: 'first-live-boundary',
+          sampleCallSite: 'onStats:startup-first-live-boundary',
+          applyBoundary: 'presentation-startup-first-live-boundary',
+          sequence: Number(tuningApplySequenceRef.current || 0),
+          runtimeSessionKey,
+          sample: {
+            rawElapsedSec: Number(STARTUP_FIRST_LIVE_SAMPLE_SEC || 0),
+            sampleSec: Number(startupSnapshot?.sampleSec || 0),
+          },
+          weather: startupWeather,
+          derivedConfig: startupHintedConfig,
+          linkedConfig: getLinkedEffectiveConfig(startupHintedConfig),
+          tuningApplyTrace: startupTrace,
         })
-        activeEngine.setTuningConfig(getLinkedEffectiveConfig(startupHintedConfig))
+        activeEngine.consumeRuntimeInputQueueAtBoundary?.('presentation-startup-first-live-boundary')
         tuningApplySequenceRef.current += 1
         startupFirstLiveSamplePendingRef.current = false
 
@@ -788,6 +832,19 @@ function PresentationPage() {
           })
         }
       },
+    })
+
+    // Slice A scaffold wiring only: provide session lineage context to engine-owned
+    // startup authority diagnostics. Startup control flow remains Presentation-driven.
+    engine.setSessionStartupAuthorityContext?.({
+      runtimeSessionKey,
+      bootPath: bootstrapPathIsRefreshRef.current ? 'refresh' : 'publish-restart',
+      publishRevision,
+      restartToken,
+    })
+    engine.setSimulationClockContext?.({
+      runtimeSessionKey,
+      durationSec: timelineDurationSec,
     })
 
     if (isDevRuntime()) {
@@ -840,7 +897,11 @@ function PresentationPage() {
         // Shared bootstrap: resolve first rain window via fine-grained scan and pre-apply
         // weather-driven config so initializeRaindropRenderer is primed with correct
         // dropletsPerSeconds on this startup path too.
-        const bootstrap = resolvePreStartBootstrapConfig(schedulerRef.current, basePreset, timelineDurationSec)
+        const bootstrap = engine.resolveCanonicalPreStartBootstrap?.({
+          schedulerRuntime: schedulerRef.current,
+          basePreset,
+          timelineDurationSec,
+        }) || resolvePreStartBootstrapConfig(schedulerRef.current, basePreset, timelineDurationSec)
         if (bootstrap.drivenConfig) {
           const hintedConfig = withSchedulerInvariantHints(bootstrap.drivenConfig, bootstrap.weather)
           engine.stageTuningApplyTrace?.({
@@ -942,7 +1003,11 @@ function PresentationPage() {
     // initializeRaindropRenderer creates the RaindropFX instance with the correct
     // dropletsPerSeconds. Both publish-restart and browser-refresh call this same helper
     // so the renderer is primed identically from the same published payload.
-    const bootstrap = resolvePreStartBootstrapConfig(schedulerRef.current, basePreset, timelineDurationSec)
+    const bootstrap = engine.resolveCanonicalPreStartBootstrap?.({
+      schedulerRuntime: schedulerRef.current,
+      basePreset,
+      timelineDurationSec,
+    }) || resolvePreStartBootstrapConfig(schedulerRef.current, basePreset, timelineDurationSec)
     if (bootstrap.drivenConfig) {
       const hintedConfig = withSchedulerInvariantHints(bootstrap.drivenConfig, bootstrap.weather)
       engine.stageTuningApplyTrace?.({
@@ -1060,6 +1125,13 @@ function PresentationPage() {
         sampleElapsedSec = engineStartupFrameIndex / 60
         sampleCallSite = 'updateAtmosphere:startup-frame-sync'
       }
+      const startupPhaseTag = resolveStartupPhaseTag(sampleCallSite)
+      engineRef.current?.noteSimulationSampleBoundary?.({
+        elapsedSec: sampleElapsedSec,
+        callSite: sampleCallSite,
+        startupPhaseTag,
+        engineFrame: engineStartupFrameIndex,
+      })
       const snapshot = schedulerRef.current.sample({
         elapsedSec: sampleElapsedSec,
         fps: 60,
@@ -1075,7 +1147,7 @@ function PresentationPage() {
       const tuningApplyTrace = {
         sampleCallSite,
         sampleSequence: Number(tuningApplySequenceRef.current || 0),
-        startupPhaseTag: resolveStartupPhaseTag(sampleCallSite),
+        startupPhaseTag,
         startupInvocationSource: String(invocationSource || 'interval-tick'),
         startupSequenceIndex: Number(tuningApplySequenceRef.current || 0),
         startupEngineFrame: Number(engineStartupFrameIndex || 0),
@@ -1091,6 +1163,7 @@ function PresentationPage() {
         derivedDropletsPerSeconds: Number(hintedConfig?.renderer?.dropletsPerSeconds || 0),
         rainTrackInputs: summarizeRainTrackInputs(snapshot),
       }
+      const linkedConfig = getLinkedEffectiveConfig(hintedConfig)
 
       const isStartupPreFrameSample =
         sampleCallSite === 'updateAtmosphere:canonical-zero-handoff' ||
@@ -1181,14 +1254,44 @@ function PresentationPage() {
         const previousSignature = startupPreFrameAppliedSignatureRef.current
         if (previousSignature !== startupPreFrameApplySignature) {
           startupPreFrameAppliedSignatureRef.current = startupPreFrameApplySignature
-          engineRef.current?.stageTuningApplyTrace?.(tuningApplyTrace)
-          engineRef.current?.setTuningConfig(getLinkedEffectiveConfig(hintedConfig))
+          engineRef.current?.enqueueRuntimeInputEnvelope?.({
+            source: 'presentation:updateAtmosphere',
+            phaseTag: tuningApplyTrace.startupPhaseTag,
+            sampleCallSite,
+            applyBoundary: 'presentation-updateAtmosphere',
+            sequence: Number(tuningApplySequenceRef.current || 0),
+            runtimeSessionKey,
+            sample: {
+              rawElapsedSec: Number(sampleElapsedSec || 0),
+              sampleSec: Number(snapshot?.sampleSec || 0),
+            },
+            weather,
+            derivedConfig: hintedConfig,
+            linkedConfig,
+            tuningApplyTrace,
+          })
+          engineRef.current?.consumeRuntimeInputQueueAtBoundary?.('presentation-updateAtmosphere')
           tuningApplySequenceRef.current += 1
         }
       } else {
         startupPreFrameAppliedSignatureRef.current = null
-        engineRef.current?.stageTuningApplyTrace?.(tuningApplyTrace)
-        engineRef.current?.setTuningConfig(getLinkedEffectiveConfig(hintedConfig))
+        engineRef.current?.enqueueRuntimeInputEnvelope?.({
+          source: 'presentation:updateAtmosphere',
+          phaseTag: tuningApplyTrace.startupPhaseTag,
+          sampleCallSite,
+          applyBoundary: 'presentation-updateAtmosphere',
+          sequence: Number(tuningApplySequenceRef.current || 0),
+          runtimeSessionKey,
+          sample: {
+            rawElapsedSec: Number(sampleElapsedSec || 0),
+            sampleSec: Number(snapshot?.sampleSec || 0),
+          },
+          weather,
+          derivedConfig: hintedConfig,
+          linkedConfig,
+          tuningApplyTrace,
+        })
+        engineRef.current?.consumeRuntimeInputQueueAtBoundary?.('presentation-updateAtmosphere')
         tuningApplySequenceRef.current += 1
       }
       const engineFrameAfterApply = Number(engineRef.current?.wetnessFrameCounter || 0)

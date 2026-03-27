@@ -2,6 +2,27 @@ const clamp = (value, min, max) => Math.max(min, Math.min(max, value))
 import { RaindropFxRendererAdapter } from './RaindropFxRendererAdapter'
 import { SurfaceWetnessField } from './SurfaceWetnessField'
 import { DEFAULT_TUNING_CONFIG, deepClone, mergeDeep } from '../tuning/tuningConfig'
+import { buildRuntimeWeatherDrivenConfig } from '../runtime/runtimeExecution'
+
+const ENGINE_SESSION_STARTUP_PHASES = {
+  CONSTRUCTED: 'constructed',
+  BOOTSTRAP_READY: 'bootstrap-ready',
+  CANONICAL_BOOTSTRAP_APPLIED: 'canonical-bootstrap-applied',
+  STARTUP_HOLD: 'startup-hold',
+  FIRST_LIVE_BOUNDARY_REACHED: 'first-live-boundary-reached',
+  STEADY_LIVE: 'steady-live',
+  STOPPED: 'stopped',
+}
+
+const ENGINE_SIMULATION_CLOCK_PHASES = {
+  CONSTRUCTED: 'constructed',
+  CANONICAL_STARTUP: 'canonical-startup',
+  FIRST_LIVE_BOUNDARY: 'first-live-boundary',
+  STEADY_LIVE: 'steady-live',
+  LOCKED: 'locked',
+  STOPPED: 'stopped',
+}
+
 
 /**
  * MistyOS runtime contract (non-negotiable):
@@ -101,6 +122,57 @@ export class WetSurfaceEngine {
       initialFrameDiagnostics: [],
       wetnessLifecycleTrace: [],
       setTuningLineageTrace: [],
+      canonicalPreStartBootstrap: null,
+    }
+    // Slice A scaffold: engine-owned startup/session phase model.
+    // This is diagnostics-only in this pass; Presentation still drives startup behavior.
+    this.sessionStartupAuthority = {
+      schemaVersion: 1,
+      currentPhase: ENGINE_SESSION_STARTUP_PHASES.CONSTRUCTED,
+      phaseHistory: [
+        {
+          phase: ENGINE_SESSION_STARTUP_PHASES.CONSTRUCTED,
+          reason: 'engine-constructor',
+          atWetnessFrameCounter: 0,
+          atPerfNowMs: Number(performance.now() || 0),
+        },
+      ],
+      session: {
+        runtimeSessionKey: null,
+        bootPath: 'unknown',
+        publishRevision: null,
+        restartToken: null,
+      },
+      flags: {
+        sawCanonicalBootstrap: false,
+        sawStartupHold: false,
+        sawFirstLiveBoundary: false,
+        sawSteadyLive: false,
+      },
+      lastTransition: null,
+    }
+    // Slice B scaffold: engine-owned simulation clock/session timing model.
+    // In this transitional pass it is diagnostics-first and mirrors current Presentation-driven
+    // control flow. Later slices can migrate timing ownership onto this boundary.
+    this.simulationClockAuthority = {
+      schemaVersion: 1,
+      session: {
+        runtimeSessionKey: null,
+        durationSec: 180,
+      },
+      phase: ENGINE_SIMULATION_CLOCK_PHASES.CONSTRUCTED,
+      anchorNowMs: Number(performance.now() || 0),
+      offsetSec: 0,
+      lockedSec: null,
+      currentTimeSec: 0,
+      loopTimeSec: 0,
+      frameStepCount: 0,
+      totalAdvancedSec: 0,
+      lastAdvancedDtSec: 0,
+      startupPhaseAtLastUpdate: ENGINE_SESSION_STARTUP_PHASES.CONSTRUCTED,
+      lastOperation: 'constructor',
+      lastSampleBoundary: null,
+      history: [],
     }
     this.rendererProbeCanvas = document.createElement('canvas')
     this.rendererProbeCanvas.width = 64
@@ -220,6 +292,18 @@ export class WetSurfaceEngine {
       applyLiveSettingsCalls: 0,
     }
     this.pendingTuningApplyTrace = null
+    // Slice D scaffold: explicit Presentation->Engine input envelope queue.
+    // Inputs can be derived in Presentation for now, but application moment is engine-owned
+    // through enqueue + consume-at-boundary APIs.
+    this.runtimeInputQueue = []
+    this.runtimeInputAuthority = {
+      schemaVersion: 1,
+      enqueuedCount: 0,
+      consumedCount: 0,
+      lastEnqueuedEnvelope: null,
+      lastConsumedEnvelope: null,
+      recentConsumedEnvelopes: [],
+    }
     this.runtimeRainContractViolationLogged = false
     this.runnerCarveCurrentFrameProbes = []
     this.runnerCarvePendingRecoveryProbes = []
@@ -253,9 +337,590 @@ export class WetSurfaceEngine {
   }
 
   stageTuningApplyTrace(meta = null) {
+    this.updateSessionStartupPhaseFromTuningTrace(meta)
     this.pendingTuningApplyTrace = meta && typeof meta === 'object'
       ? { ...meta }
       : null
+  }
+
+  setSessionStartupAuthorityContext(context = null) {
+    const input = context && typeof context === 'object' ? context : {}
+    this.sessionStartupAuthority.session = {
+      runtimeSessionKey: input.runtimeSessionKey != null ? String(input.runtimeSessionKey) : null,
+      bootPath: input.bootPath != null ? String(input.bootPath) : 'unknown',
+      publishRevision: Number.isFinite(Number(input.publishRevision)) ? Number(input.publishRevision) : null,
+      restartToken: input.restartToken != null ? String(input.restartToken) : null,
+    }
+
+    this.simulationClockAuthority.session = {
+      ...this.simulationClockAuthority.session,
+      runtimeSessionKey: input.runtimeSessionKey != null ? String(input.runtimeSessionKey) : null,
+    }
+
+  }
+
+  setSimulationClockContext(context = null) {
+    const input = context && typeof context === 'object' ? context : {}
+    const nextDurationSec = Number.isFinite(Number(input.durationSec))
+      ? Math.max(0.001, Number(input.durationSec))
+      : Number(this.simulationClockAuthority.session?.durationSec || 180)
+
+    this.simulationClockAuthority.session = {
+      runtimeSessionKey: input.runtimeSessionKey != null
+        ? String(input.runtimeSessionKey)
+        : this.simulationClockAuthority.session?.runtimeSessionKey ?? null,
+      durationSec: nextDurationSec,
+    }
+  }
+
+  normalizeSimulationClockLoopTime(timeSec) {
+    const durationSec = Math.max(0.001, Number(this.simulationClockAuthority.session?.durationSec || 180))
+    const value = Number.isFinite(Number(timeSec)) ? Number(timeSec) : 0
+    return value >= 0 ? value % durationSec : ((value % durationSec) + durationSec) % durationSec
+  }
+
+  pushSimulationClockHistory(event) {
+    const history = this.simulationClockAuthority.history
+    if (!Array.isArray(history)) {
+      return
+    }
+    history.push(event)
+    if (history.length > 128) {
+      history.shift()
+    }
+  }
+
+  updateSimulationClockPhaseFromStartup() {
+    const startupPhase = String(this.sessionStartupAuthority.currentPhase || ENGINE_SESSION_STARTUP_PHASES.CONSTRUCTED)
+    this.simulationClockAuthority.startupPhaseAtLastUpdate = startupPhase
+
+    if (startupPhase === ENGINE_SESSION_STARTUP_PHASES.STOPPED) {
+      this.simulationClockAuthority.phase = ENGINE_SIMULATION_CLOCK_PHASES.STOPPED
+    } else if (Number.isFinite(this.simulationClockAuthority.lockedSec)) {
+      this.simulationClockAuthority.phase = ENGINE_SIMULATION_CLOCK_PHASES.LOCKED
+    } else if (startupPhase === ENGINE_SESSION_STARTUP_PHASES.FIRST_LIVE_BOUNDARY_REACHED) {
+      this.simulationClockAuthority.phase = ENGINE_SIMULATION_CLOCK_PHASES.FIRST_LIVE_BOUNDARY
+    } else if (startupPhase === ENGINE_SESSION_STARTUP_PHASES.STEADY_LIVE) {
+      this.simulationClockAuthority.phase = ENGINE_SIMULATION_CLOCK_PHASES.STEADY_LIVE
+    } else if (
+      startupPhase === ENGINE_SESSION_STARTUP_PHASES.BOOTSTRAP_READY ||
+      startupPhase === ENGINE_SESSION_STARTUP_PHASES.CANONICAL_BOOTSTRAP_APPLIED ||
+      startupPhase === ENGINE_SESSION_STARTUP_PHASES.STARTUP_HOLD
+    ) {
+      this.simulationClockAuthority.phase = ENGINE_SIMULATION_CLOCK_PHASES.CANONICAL_STARTUP
+    } else {
+      this.simulationClockAuthority.phase = ENGINE_SIMULATION_CLOCK_PHASES.CONSTRUCTED
+    }
+
+  }
+
+  resetSimulationClock(options = {}) {
+    const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Number(performance.now() || 0)
+    const reason = String(options.reason || 'reset')
+    const startSec = Number.isFinite(Number(options.startSec)) ? Math.max(0, Number(options.startSec)) : 0
+
+    this.simulationClockAuthority.anchorNowMs = nowMs
+    this.simulationClockAuthority.offsetSec = startSec
+    this.simulationClockAuthority.lockedSec = null
+    this.simulationClockAuthority.currentTimeSec = startSec
+    this.simulationClockAuthority.loopTimeSec = this.normalizeSimulationClockLoopTime(startSec)
+    this.simulationClockAuthority.lastOperation = `reset:${reason}`
+
+    this.updateSimulationClockPhaseFromStartup()
+    this.pushSimulationClockHistory({
+      op: 'reset',
+      reason,
+      atNowMs: nowMs,
+      currentTimeSec: this.simulationClockAuthority.currentTimeSec,
+      loopTimeSec: this.simulationClockAuthority.loopTimeSec,
+      phase: this.simulationClockAuthority.phase,
+      startupPhase: this.simulationClockAuthority.startupPhaseAtLastUpdate,
+    })
+  }
+
+  seekSimulationClock(targetSec, options = {}) {
+    const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Number(performance.now() || 0)
+    const lockAtTarget = options.lockAtTarget === true
+    const reason = String(options.reason || 'seek')
+    const durationSec = Math.max(0.001, Number(this.simulationClockAuthority.session?.durationSec || 180))
+    const clampedSec = clamp(Number(targetSec || 0), 0, durationSec)
+
+    this.simulationClockAuthority.anchorNowMs = nowMs
+    if (lockAtTarget) {
+      this.simulationClockAuthority.lockedSec = clampedSec
+      this.simulationClockAuthority.currentTimeSec = clampedSec
+    } else {
+      this.simulationClockAuthority.lockedSec = null
+      this.simulationClockAuthority.offsetSec = clampedSec
+      this.simulationClockAuthority.currentTimeSec = clampedSec
+    }
+    this.simulationClockAuthority.loopTimeSec = this.normalizeSimulationClockLoopTime(clampedSec)
+    this.simulationClockAuthority.lastOperation = `seek:${reason}`
+
+    this.updateSimulationClockPhaseFromStartup()
+    if (lockAtTarget) {
+      this.simulationClockAuthority.phase = ENGINE_SIMULATION_CLOCK_PHASES.LOCKED
+    }
+
+    this.pushSimulationClockHistory({
+      op: 'seek',
+      reason,
+      lockAtTarget,
+      targetSec: clampedSec,
+      atNowMs: nowMs,
+      phase: this.simulationClockAuthority.phase,
+      startupPhase: this.simulationClockAuthority.startupPhaseAtLastUpdate,
+    })
+  }
+
+  sampleSimulationClock(nowMs = performance.now()) {
+    const nowValue = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Number(performance.now() || 0)
+    const lockedSec = this.simulationClockAuthority.lockedSec
+    if (Number.isFinite(lockedSec)) {
+      this.simulationClockAuthority.currentTimeSec = Number(lockedSec)
+      this.simulationClockAuthority.loopTimeSec = this.normalizeSimulationClockLoopTime(lockedSec)
+      this.simulationClockAuthority.lastOperation = 'sample:locked'
+      this.updateSimulationClockPhaseFromStartup()
+      this.simulationClockAuthority.phase = ENGINE_SIMULATION_CLOCK_PHASES.LOCKED
+      return Number(lockedSec)
+    }
+
+    const elapsedSec = Math.max(0, (nowValue - Number(this.simulationClockAuthority.anchorNowMs || nowValue)) / 1000)
+    const currentSec = Math.max(0, Number(this.simulationClockAuthority.offsetSec || 0) + elapsedSec)
+    this.simulationClockAuthority.currentTimeSec = currentSec
+    this.simulationClockAuthority.loopTimeSec = this.normalizeSimulationClockLoopTime(currentSec)
+    this.simulationClockAuthority.lastOperation = 'sample:running'
+    this.updateSimulationClockPhaseFromStartup()
+    return currentSec
+  }
+
+  mirrorPresentationClockSample(sample = null) {
+    const input = sample && typeof sample === 'object' ? sample : {}
+    const nowMs = Number.isFinite(Number(input.nowMs)) ? Number(input.nowMs) : Number(performance.now() || 0)
+    const currentTimeSec = Number.isFinite(Number(input.currentTimeSec)) ? Math.max(0, Number(input.currentTimeSec)) : null
+
+    if (currentTimeSec === null) {
+      return
+    }
+
+    this.simulationClockAuthority.currentTimeSec = currentTimeSec
+    this.simulationClockAuthority.loopTimeSec = this.normalizeSimulationClockLoopTime(currentTimeSec)
+    this.simulationClockAuthority.lastOperation = `mirror:${String(input.source || 'presentation')}`
+    this.updateSimulationClockPhaseFromStartup()
+
+    this.pushSimulationClockHistory({
+      op: 'mirror',
+      source: String(input.source || 'presentation'),
+      callSite: String(input.callSite || ''),
+      currentTimeSec,
+      atNowMs: nowMs,
+      phase: this.simulationClockAuthority.phase,
+      startupPhase: this.simulationClockAuthority.startupPhaseAtLastUpdate,
+    })
+  }
+
+  noteSimulationSampleBoundary(boundary = null) {
+    const input = boundary && typeof boundary === 'object' ? boundary : {}
+    const elapsedSec = Number.isFinite(Number(input.elapsedSec)) ? Math.max(0, Number(input.elapsedSec)) : null
+    if (elapsedSec === null) {
+      return
+    }
+
+    this.simulationClockAuthority.lastSampleBoundary = {
+      elapsedSec,
+      callSite: String(input.callSite || 'unknown'),
+      startupPhaseTag: String(input.startupPhaseTag || 'non-startup'),
+      engineFrame: Number.isFinite(Number(input.engineFrame)) ? Number(input.engineFrame) : Number(this.wetnessFrameCounter || 0),
+      atNowMs: Number.isFinite(Number(input.nowMs)) ? Number(input.nowMs) : Number(performance.now() || 0),
+    }
+  }
+
+  noteSimulationFrameAdvance(dtSec, nowMs = performance.now()) {
+    const nextDt = Number.isFinite(Number(dtSec)) ? Math.max(0, Number(dtSec)) : 0
+    const nowValue = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Number(performance.now() || 0)
+
+    this.simulationClockAuthority.frameStepCount += 1
+    this.simulationClockAuthority.totalAdvancedSec += nextDt
+    this.simulationClockAuthority.lastAdvancedDtSec = nextDt
+    this.simulationClockAuthority.lastOperation = 'frame-advance'
+    this.sampleSimulationClock(nowValue)
+  }
+
+  getSimulationClockSnapshot() {
+    return {
+      schemaVersion: Number(this.simulationClockAuthority.schemaVersion || 1),
+      session: {
+        runtimeSessionKey: this.simulationClockAuthority.session?.runtimeSessionKey ?? null,
+        durationSec: Number(this.simulationClockAuthority.session?.durationSec || 180),
+      },
+      phase: String(this.simulationClockAuthority.phase || ENGINE_SIMULATION_CLOCK_PHASES.CONSTRUCTED),
+      startupPhaseAtLastUpdate: String(this.simulationClockAuthority.startupPhaseAtLastUpdate || ENGINE_SESSION_STARTUP_PHASES.CONSTRUCTED),
+      anchorNowMs: Number(this.simulationClockAuthority.anchorNowMs || 0),
+      offsetSec: Number(this.simulationClockAuthority.offsetSec || 0),
+      lockedSec: Number.isFinite(this.simulationClockAuthority.lockedSec) ? Number(this.simulationClockAuthority.lockedSec) : null,
+      currentTimeSec: Number(this.simulationClockAuthority.currentTimeSec || 0),
+      loopTimeSec: Number(this.simulationClockAuthority.loopTimeSec || 0),
+      frameStepCount: Number(this.simulationClockAuthority.frameStepCount || 0),
+      totalAdvancedSec: Number(this.simulationClockAuthority.totalAdvancedSec || 0),
+      lastAdvancedDtSec: Number(this.simulationClockAuthority.lastAdvancedDtSec || 0),
+      lastOperation: String(this.simulationClockAuthority.lastOperation || 'none'),
+      lastSampleBoundary: this.simulationClockAuthority.lastSampleBoundary
+        ? { ...this.simulationClockAuthority.lastSampleBoundary }
+        : null,
+      history: Array.isArray(this.simulationClockAuthority.history)
+        ? this.simulationClockAuthority.history.map((entry) => ({ ...entry }))
+        : [],
+    }
+  }
+
+  advanceSessionStartupPhase(nextPhase, reason = 'unspecified', extra = null) {
+    const previousPhase = String(this.sessionStartupAuthority.currentPhase || ENGINE_SESSION_STARTUP_PHASES.CONSTRUCTED)
+    if (previousPhase === nextPhase) {
+      return
+    }
+
+    const transition = {
+      phase: nextPhase,
+      reason: String(reason || 'unspecified'),
+      atWetnessFrameCounter: Number(this.wetnessFrameCounter || 0),
+      atPerfNowMs: Number(performance.now() || 0),
+      ...(extra && typeof extra === 'object' ? extra : {}),
+    }
+
+    this.sessionStartupAuthority.currentPhase = nextPhase
+    this.sessionStartupAuthority.lastTransition = { ...transition }
+
+    const history = this.sessionStartupAuthority.phaseHistory
+    if (Array.isArray(history)) {
+      history.push(transition)
+      if (history.length > 96) {
+        history.shift()
+      }
+    }
+
+    if (nextPhase === ENGINE_SESSION_STARTUP_PHASES.CANONICAL_BOOTSTRAP_APPLIED) {
+      this.sessionStartupAuthority.flags.sawCanonicalBootstrap = true
+    } else if (nextPhase === ENGINE_SESSION_STARTUP_PHASES.STARTUP_HOLD) {
+      this.sessionStartupAuthority.flags.sawStartupHold = true
+    } else if (nextPhase === ENGINE_SESSION_STARTUP_PHASES.FIRST_LIVE_BOUNDARY_REACHED) {
+      this.sessionStartupAuthority.flags.sawFirstLiveBoundary = true
+    } else if (nextPhase === ENGINE_SESSION_STARTUP_PHASES.STEADY_LIVE) {
+      this.sessionStartupAuthority.flags.sawSteadyLive = true
+    }
+
+    this.updateSimulationClockPhaseFromStartup()
+  }
+
+  updateSessionStartupPhaseFromTuningTrace(stagedApplyTrace = null) {
+    const trace = stagedApplyTrace && typeof stagedApplyTrace === 'object' ? stagedApplyTrace : null
+    if (!trace) {
+      return
+    }
+
+    const sampleCallSite = String(trace.sampleCallSite || '')
+    const startupPhaseTag = String(trace.startupPhaseTag || '')
+
+    if (startupPhaseTag === 'canonical-bootstrap' || sampleCallSite.startsWith('start:')) {
+      this.advanceSessionStartupPhase(ENGINE_SESSION_STARTUP_PHASES.CANONICAL_BOOTSTRAP_APPLIED, sampleCallSite || startupPhaseTag)
+      return
+    }
+
+    if (
+      startupPhaseTag === 'pre-live-hold' ||
+      sampleCallSite === 'updateAtmosphere:canonical-zero-handoff' ||
+      sampleCallSite === 'updateAtmosphere:startup-frame0-hold'
+    ) {
+      this.advanceSessionStartupPhase(ENGINE_SESSION_STARTUP_PHASES.STARTUP_HOLD, sampleCallSite || startupPhaseTag)
+      return
+    }
+
+    if (startupPhaseTag === 'first-live-boundary' || sampleCallSite === 'onStats:startup-first-live-boundary') {
+      this.advanceSessionStartupPhase(ENGINE_SESSION_STARTUP_PHASES.FIRST_LIVE_BOUNDARY_REACHED, sampleCallSite || startupPhaseTag)
+      return
+    }
+
+    if (startupPhaseTag === 'non-startup' || sampleCallSite === 'updateAtmosphere:getPresentationTimeSec') {
+      if (this.sessionStartupAuthority.flags.sawFirstLiveBoundary) {
+        this.advanceSessionStartupPhase(ENGINE_SESSION_STARTUP_PHASES.STEADY_LIVE, sampleCallSite || startupPhaseTag)
+      }
+    }
+  }
+
+  getSessionStartupAuthoritySnapshot() {
+    return {
+      schemaVersion: Number(this.sessionStartupAuthority.schemaVersion || 1),
+      currentPhase: String(this.sessionStartupAuthority.currentPhase || ENGINE_SESSION_STARTUP_PHASES.CONSTRUCTED),
+      session: {
+        runtimeSessionKey: this.sessionStartupAuthority.session?.runtimeSessionKey ?? null,
+        bootPath: this.sessionStartupAuthority.session?.bootPath ?? 'unknown',
+        publishRevision: this.sessionStartupAuthority.session?.publishRevision ?? null,
+        restartToken: this.sessionStartupAuthority.session?.restartToken ?? null,
+      },
+      flags: {
+        sawCanonicalBootstrap: Boolean(this.sessionStartupAuthority.flags?.sawCanonicalBootstrap),
+        sawStartupHold: Boolean(this.sessionStartupAuthority.flags?.sawStartupHold),
+        sawFirstLiveBoundary: Boolean(this.sessionStartupAuthority.flags?.sawFirstLiveBoundary),
+        sawSteadyLive: Boolean(this.sessionStartupAuthority.flags?.sawSteadyLive),
+      },
+      lastTransition: this.sessionStartupAuthority.lastTransition
+        ? { ...this.sessionStartupAuthority.lastTransition }
+        : null,
+      phaseHistory: Array.isArray(this.sessionStartupAuthority.phaseHistory)
+        ? this.sessionStartupAuthority.phaseHistory.map((entry) => ({ ...entry }))
+        : [],
+    }
+  }
+
+  buildRuntimeInputEnvelope(input = {}) {
+    const payload = input && typeof input === 'object' ? input : {}
+    const sample = payload?.sample && typeof payload.sample === 'object' ? payload.sample : {}
+    const weather = payload?.weather && typeof payload.weather === 'object' ? payload.weather : null
+    const source = String(payload.source || 'unknown')
+    const applyBoundary = String(payload.applyBoundary || 'presentation-update-boundary')
+    const sequence = Number.isFinite(Number(payload.sequence)) ? Number(payload.sequence) : this.runtimeInputAuthority.enqueuedCount
+
+    return {
+      envelopeKind: 'runtime-weather-config-update',
+      source,
+      phaseTag: String(payload.phaseTag || 'non-startup'),
+      sampleCallSite: String(payload.sampleCallSite || ''),
+      applyBoundary,
+      sequence,
+      runtimeSessionKey: payload.runtimeSessionKey != null ? String(payload.runtimeSessionKey) : null,
+      sample: {
+        rawElapsedSec: Number.isFinite(Number(sample.rawElapsedSec)) ? Number(sample.rawElapsedSec) : null,
+        sampleSec: Number.isFinite(Number(sample.sampleSec)) ? Number(sample.sampleSec) : null,
+      },
+      weather: weather
+        ? {
+          wind: Number(weather.wind || 0),
+          rain: Number(weather.rain || 0),
+          mist: Number(weather.mist || 0),
+          washdown: Number(weather.washdown || 0),
+          fogBuildup: Number(weather.fogBuildup || 0),
+          fogClearing: Number(weather.fogClearing || 0),
+        }
+        : null,
+      derivedConfig: payload.derivedConfig && typeof payload.derivedConfig === 'object'
+        ? deepClone(payload.derivedConfig)
+        : null,
+      linkedConfig: payload.linkedConfig && typeof payload.linkedConfig === 'object'
+        ? deepClone(payload.linkedConfig)
+        : null,
+      tuningApplyTrace: payload.tuningApplyTrace && typeof payload.tuningApplyTrace === 'object'
+        ? { ...payload.tuningApplyTrace }
+        : null,
+      enqueueNowMs: Number(performance.now() || 0),
+      consumedNowMs: null,
+      consumedBoundary: null,
+    }
+  }
+
+  enqueueRuntimeInputEnvelope(input = {}) {
+    const envelope = this.buildRuntimeInputEnvelope(input)
+    this.runtimeInputQueue.push(envelope)
+    this.runtimeInputAuthority.enqueuedCount += 1
+    this.runtimeInputAuthority.lastEnqueuedEnvelope = {
+      sequence: envelope.sequence,
+      source: envelope.source,
+      applyBoundary: envelope.applyBoundary,
+      phaseTag: envelope.phaseTag,
+      sampleSec: envelope.sample?.sampleSec ?? null,
+      runtimeSessionKey: envelope.runtimeSessionKey,
+      enqueueNowMs: envelope.enqueueNowMs,
+    }
+    return envelope
+  }
+
+  consumeRuntimeInputQueueAtBoundary(boundary = 'presentation-update-boundary') {
+    const boundaryTag = String(boundary || 'presentation-update-boundary')
+    if (!Array.isArray(this.runtimeInputQueue) || this.runtimeInputQueue.length === 0) {
+      return null
+    }
+
+    const index = this.runtimeInputQueue.findIndex((envelope) => {
+      const applyBoundary = String(envelope?.applyBoundary || '')
+      return applyBoundary === boundaryTag || applyBoundary === 'any'
+    })
+
+    if (index < 0) {
+      return null
+    }
+
+    const [envelope] = this.runtimeInputQueue.splice(index, 1)
+    if (!envelope) {
+      return null
+    }
+
+    if (envelope.tuningApplyTrace) {
+      this.stageTuningApplyTrace(envelope.tuningApplyTrace)
+    }
+    if (envelope.linkedConfig) {
+      this.setTuningConfig(envelope.linkedConfig)
+    }
+
+    envelope.consumedNowMs = Number(performance.now() || 0)
+    envelope.consumedBoundary = boundaryTag
+    this.runtimeInputAuthority.consumedCount += 1
+    this.runtimeInputAuthority.lastConsumedEnvelope = {
+      sequence: envelope.sequence,
+      source: envelope.source,
+      applyBoundary: envelope.applyBoundary,
+      phaseTag: envelope.phaseTag,
+      sampleSec: envelope.sample?.sampleSec ?? null,
+      runtimeSessionKey: envelope.runtimeSessionKey,
+      consumedBoundary: boundaryTag,
+      consumedNowMs: envelope.consumedNowMs,
+    }
+
+    this.runtimeInputAuthority.recentConsumedEnvelopes.push({
+      sequence: envelope.sequence,
+      source: envelope.source,
+      phaseTag: envelope.phaseTag,
+      sampleSec: envelope.sample?.sampleSec ?? null,
+      consumedBoundary: boundaryTag,
+      consumedNowMs: envelope.consumedNowMs,
+    })
+    if (this.runtimeInputAuthority.recentConsumedEnvelopes.length > 32) {
+      this.runtimeInputAuthority.recentConsumedEnvelopes.shift()
+    }
+
+    return envelope
+  }
+
+  getRuntimeInputAuthoritySnapshot() {
+    return {
+      schemaVersion: Number(this.runtimeInputAuthority.schemaVersion || 1),
+      queueDepth: Array.isArray(this.runtimeInputQueue) ? this.runtimeInputQueue.length : 0,
+      enqueuedCount: Number(this.runtimeInputAuthority.enqueuedCount || 0),
+      consumedCount: Number(this.runtimeInputAuthority.consumedCount || 0),
+      lastEnqueuedEnvelope: this.runtimeInputAuthority.lastEnqueuedEnvelope
+        ? { ...this.runtimeInputAuthority.lastEnqueuedEnvelope }
+        : null,
+      lastConsumedEnvelope: this.runtimeInputAuthority.lastConsumedEnvelope
+        ? { ...this.runtimeInputAuthority.lastConsumedEnvelope }
+        : null,
+      recentConsumedEnvelopes: Array.isArray(this.runtimeInputAuthority.recentConsumedEnvelopes)
+        ? this.runtimeInputAuthority.recentConsumedEnvelopes.map((entry) => ({ ...entry }))
+        : [],
+      pendingEnvelopeHeaders: Array.isArray(this.runtimeInputQueue)
+        ? this.runtimeInputQueue.map((envelope) => ({
+          sequence: envelope.sequence,
+          source: envelope.source,
+          applyBoundary: envelope.applyBoundary,
+          phaseTag: envelope.phaseTag,
+          sampleSec: envelope.sample?.sampleSec ?? null,
+        }))
+        : [],
+    }
+  }
+
+  resolveCanonicalPreStartBootstrap(options = {}) {
+    const schedulerRuntime = options?.schedulerRuntime || null
+    const basePreset = options?.basePreset || null
+    const timelineDurationSec = Number.isFinite(Number(options?.timelineDurationSec))
+      ? Number(options.timelineDurationSec)
+      : 180
+
+    const empty = {
+      firstRainWindowSec: null,
+      rainContributionFound: false,
+      preStartSec: 0,
+      rainAtZero: 0,
+      rainAtWindow: 0,
+      dropletsPerSeconds: 0,
+      weather: null,
+      drivenConfig: null,
+      scanSteps: 0,
+      snapAtZero: null,
+      preStartSnap: null,
+    }
+
+    if (!schedulerRuntime || !basePreset) {
+      return empty
+    }
+
+    const durationSec = Math.max(0.001, schedulerRuntime.durationSec || timelineDurationSec || 180)
+    const snapAtZero = schedulerRuntime.sample({ elapsedSec: 0, fps: 60 })
+    const rainAtZero = snapAtZero?.weather?.rain || 0
+
+    let firstRainWindowSec = null
+    let rainContributionFound = false
+    let scanSteps = 0
+
+    const fineUntilSec = Math.min(30, durationSec)
+    for (let t = 0; t <= fineUntilSec; t += 0.01) {
+      scanSteps += 1
+      const snap = schedulerRuntime.sample({ elapsedSec: t, fps: 60, includeDiagnostics: true })
+      const rainVal = snap?.weather?.rain || 0
+      if (rainVal > 0.001) {
+        if (firstRainWindowSec === null) {
+          firstRainWindowSec = t
+        }
+        const rainContribs = (snap?.diagnostics?.weatherTrackContributions || [])
+          .filter((e) => e.kind === 'rain' && (e.contribution || 0) > 0)
+        if (rainContribs.length > 0) {
+          firstRainWindowSec = t
+          rainContributionFound = true
+          break
+        }
+      }
+    }
+
+    if (!rainContributionFound) {
+      for (let t = fineUntilSec + 0.5; t <= durationSec; t += 0.5) {
+        scanSteps += 1
+        const snap = schedulerRuntime.sample({ elapsedSec: t, fps: 60, includeDiagnostics: true })
+        const rainVal = snap?.weather?.rain || 0
+        if (rainVal > 0.001) {
+          if (firstRainWindowSec === null) {
+            firstRainWindowSec = t
+          }
+          const rainContribs = (snap?.diagnostics?.weatherTrackContributions || [])
+            .filter((e) => e.kind === 'rain' && (e.contribution || 0) > 0)
+          if (rainContribs.length > 0) {
+            firstRainWindowSec = t
+            rainContributionFound = true
+            break
+          }
+        }
+      }
+    }
+
+    const preStartSec = Number.isFinite(firstRainWindowSec) ? firstRainWindowSec : 0
+    const preStartSnap = schedulerRuntime.sample({ elapsedSec: preStartSec, fps: 60, includeDiagnostics: true })
+    const weather = preStartSnap?.weather || null
+    const drivenConfig = weather ? buildRuntimeWeatherDrivenConfig(basePreset, weather) : null
+    const rainAtWindow = weather?.rain || 0
+    const dropletsPerSeconds = drivenConfig?.renderer?.dropletsPerSeconds || 0
+
+    const result = {
+      firstRainWindowSec,
+      rainContributionFound,
+      preStartSec,
+      rainAtZero,
+      rainAtWindow,
+      dropletsPerSeconds,
+      weather,
+      drivenConfig,
+      scanSteps,
+      snapAtZero,
+      preStartSnap,
+    }
+
+    this.bootstrapInfo.canonicalPreStartBootstrap = {
+      firstRainWindowSec: Number.isFinite(firstRainWindowSec) ? Number(firstRainWindowSec) : null,
+      rainContributionFound: Boolean(rainContributionFound),
+      preStartSec: Number(preStartSec || 0),
+      rainAtZero: Number(rainAtZero || 0),
+      rainAtWindow: Number(rainAtWindow || 0),
+      dropletsPerSeconds: Number(dropletsPerSeconds || 0),
+      scanSteps: Number(scanSteps || 0),
+      computedAtWetnessFrameCounter: Number(this.wetnessFrameCounter || 0),
+      startupPhase: String(this.sessionStartupAuthority.currentPhase || ''),
+    }
+
+    return result
   }
 
   resolveSetTuningOriginBucket(stagedApplyTrace) {
@@ -441,6 +1106,8 @@ export class WetSurfaceEngine {
     // Idempotent runtime startup sequence: attach renderer, re-apply current tuning,
     // then enter animation loop so publish-restart and manual refresh converge.
     this.running = true
+    this.advanceSessionStartupPhase(ENGINE_SESSION_STARTUP_PHASES.BOOTSTRAP_READY, 'engine-start-invoked')
+    this.updateSimulationClockPhaseFromStartup()
     this.resize()
     this.recordWetnessLifecycleTrace('start-after-resize')
 
@@ -465,6 +1132,7 @@ export class WetSurfaceEngine {
       }
       const seedNowMs = performance.now()
       this.lastTime = seedNowMs
+      this.sampleSimulationClock(seedNowMs)
       this.recordWetnessLifecycleTrace('animation-loop-seeded', {
         seedNowMs: Number(seedNowMs || 0),
       })
@@ -492,6 +1160,8 @@ export class WetSurfaceEngine {
 
   stop() {
     this.running = false
+    this.advanceSessionStartupPhase(ENGINE_SESSION_STARTUP_PHASES.STOPPED, 'engine-stop-invoked')
+    this.updateSimulationClockPhaseFromStartup()
 
     if (this.animationFrame) {
       cancelAnimationFrame(this.animationFrame)
@@ -2979,6 +3649,7 @@ export class WetSurfaceEngine {
     const rawDtSec = (now - lastTimeBeforeAnimateMs) / 1000
     const isFirstStartupFrame = this.wetnessFrameCounter === 0
     const dt = isFirstStartupFrame ? 0 : clamp(rawDtSec, 0, 0.08)
+    this.noteSimulationFrameAdvance(dt, now)
     this.timing.wetnessBackend = 'cpu-grid'
     this.timing.interactionBackend = 'cpu-direct'
     this.timing.gpuInteractionWritesQueued = this.gpuInteractionWriteQueue.length
@@ -3414,6 +4085,13 @@ export class WetSurfaceEngine {
         clearAreaOps: fieldStats?.clearAreaOps || 0,
         setTuningConfigCalls: this.integrationCounters.setTuningConfigCalls,
         applyLiveSettingsCalls: this.integrationCounters.applyLiveSettingsCalls,
+        simulationClockPhase: this.simulationClockAuthority.phase,
+        simulationClockCurrentTimeSec: this.simulationClockAuthority.currentTimeSec,
+        simulationClockLoopTimeSec: this.simulationClockAuthority.loopTimeSec,
+        simulationClockFrameStepCount: this.simulationClockAuthority.frameStepCount,
+        runtimeInputQueueDepth: Array.isArray(this.runtimeInputQueue) ? this.runtimeInputQueue.length : 0,
+        runtimeInputEnqueuedCount: Number(this.runtimeInputAuthority.enqueuedCount || 0),
+        runtimeInputConsumedCount: Number(this.runtimeInputAuthority.consumedCount || 0),
       },
       bootstrap: {
         rendererCreated: this.bootstrapInfo.rendererCreated,
@@ -3433,9 +4111,15 @@ export class WetSurfaceEngine {
         setTuningLineageTrace: Array.isArray(this.bootstrapInfo.setTuningLineageTrace)
           ? this.bootstrapInfo.setTuningLineageTrace.map((entry) => ({ ...entry }))
           : [],
+        canonicalPreStartBootstrap: this.bootstrapInfo.canonicalPreStartBootstrap
+          ? { ...this.bootstrapInfo.canonicalPreStartBootstrap }
+          : null,
         initialFrameDiagnostics: Array.isArray(this.bootstrapInfo.initialFrameDiagnostics)
           ? this.bootstrapInfo.initialFrameDiagnostics.map((entry) => ({ ...entry, sampledDrops: Array.isArray(entry.sampledDrops) ? entry.sampledDrops.map((drop) => ({ ...drop })) : [] }))
           : [],
+        startupAuthority: this.getSessionStartupAuthoritySnapshot(),
+        simulationClockAuthority: this.getSimulationClockSnapshot(),
+        runtimeInputAuthority: this.getRuntimeInputAuthoritySnapshot(),
       },
     })
 
