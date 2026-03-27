@@ -27,6 +27,22 @@ const ENGINE_SIMULATION_CLOCK_PHASES = {
 
 const ENGINE_STARTUP_FIRST_LIVE_FRAME = 1
 const ENGINE_STARTUP_FRAME_SYNC_END_FRAME = ENGINE_STARTUP_FIRST_LIVE_FRAME + 1
+const ENGINE_BOUNDARY_INTERNAL_ORIGIN = 'engine-internal'
+const ENGINE_ALLOWED_BOOT_PATHS = new Set(['refresh', 'publish-restart', 'unknown'])
+const ENGINE_ALLOWED_EXTERNAL_BOOTSTRAP_CALLSITES = new Set([
+  'start:shared-pre-start-bootstrap',
+  'start:static-hold-pre-start-bootstrap',
+])
+const ENGINE_ALLOWED_RUNTIME_ENVELOPE_SOURCES = new Set([
+  'engine:runtime-authority',
+  'engine:startup-authority',
+  'engine:steady-live-authority',
+])
+const ENGINE_ALLOWED_RUNTIME_APPLY_BOUNDARIES = new Set([
+  'engine-runtime-boundary',
+  'engine-startup-boundary',
+  'engine-steady-live-boundary',
+])
 
 
 /**
@@ -156,8 +172,6 @@ export class WetSurfaceEngine {
         sawSteadyLive: false,
       },
       lastTransition: null,
-      compatibilityDemotedTraceCount: 0,
-      lastDemotedTrace: null,
     }
     // Slice B scaffold: engine-owned simulation clock/session timing model.
     // In this transitional pass it is diagnostics-first and mirrors current Presentation-driven
@@ -286,10 +300,14 @@ export class WetSurfaceEngine {
       clearingMs: 0,
       diffusionMs: 0,
       imageConvertMs: 0,
-      runtimeWeatherApplyAuthority: 'presentation-startup-shim',
+      runtimeWeatherApplyAuthority: 'runtime-not-yet-applied',
       runtimeWeatherApplySource: 'none',
       runtimeWeatherApplyCallSite: 'none',
       runtimeWeatherApplySequence: -1,
+      runtimeAppliedSampleSec: 0,
+      runtimeSampledRainIntensity: 0,
+      runtimeDrivenDropletsPerSeconds: 0,
+      runtimeEffectiveRefillRate: Number(this.tuningConfig?.surfaceWetness?.refillRate || 0),
       runtimeSteadyLiveApplyCount: 0,
       runtimeStartupAuthorityOwner: 'engine',
       runtimeStartupPhaseCurrent: ENGINE_SESSION_STARTUP_PHASES.CONSTRUCTED,
@@ -315,8 +333,10 @@ export class WetSurfaceEngine {
       schemaVersion: 1,
       enqueuedCount: 0,
       consumedCount: 0,
+      rejectedCount: 0,
       lastEnqueuedEnvelope: null,
       lastConsumedEnvelope: null,
+      lastRejectedInput: null,
       recentConsumedEnvelopes: [],
     }
     this.runtimeRainContractViolationLogged = false
@@ -386,6 +406,60 @@ export class WetSurfaceEngine {
     })
   }
 
+  createInternalBoundaryOptions(method = 'unknown') {
+    return {
+      __boundaryOrigin: ENGINE_BOUNDARY_INTERNAL_ORIGIN,
+      __boundaryMethod: String(method || 'unknown'),
+    }
+  }
+
+  isInternalBoundaryCall(input = null) {
+    return input?.__boundaryOrigin === ENGINE_BOUNDARY_INTERNAL_ORIGIN
+  }
+
+  getActiveRuntimeSessionKey() {
+    return this.sessionStartupAuthority.session?.runtimeSessionKey
+      || this.startupRuntimeAuthority.runtimeSessionKey
+      || this.steadyLiveAuthority.runtimeSessionKey
+      || this.simulationClockAuthority.session?.runtimeSessionKey
+      || null
+  }
+
+  rejectBoundaryInput(method, reason, details = {}) {
+    const diagnostic = {
+      method: String(method || 'unknown'),
+      reason: String(reason || 'unknown'),
+      runtimeSessionKey: this.getActiveRuntimeSessionKey(),
+      startupPhase: String(this.sessionStartupAuthority.currentPhase || ENGINE_SESSION_STARTUP_PHASES.CONSTRUCTED),
+      atWetnessFrameCounter: Number(this.wetnessFrameCounter || 0),
+      atPerfNowMs: Number(performance.now() || 0),
+      ...(details && typeof details === 'object' ? details : {}),
+    }
+
+    this.runtimeInputAuthority.rejectedCount += 1
+    this.runtimeInputAuthority.lastRejectedInput = diagnostic
+    console.warn('[MistyOS][Engine][BoundaryReject]', diagnostic)
+
+    return {
+      accepted: false,
+      rejected: true,
+      reason: diagnostic.reason,
+    }
+  }
+
+  hasValidExternalRuntimeSession(targetRuntimeSessionKey = null) {
+    const activeRuntimeSessionKey = this.getActiveRuntimeSessionKey()
+    if (!activeRuntimeSessionKey) {
+      return false
+    }
+
+    if (targetRuntimeSessionKey == null) {
+      return true
+    }
+
+    return String(targetRuntimeSessionKey) === String(activeRuntimeSessionKey)
+  }
+
   stageTuningApplyTrace(meta = null) {
     this.updateSessionStartupPhaseFromTuningTrace(meta)
     this.pendingTuningApplyTrace = meta && typeof meta === 'object'
@@ -393,7 +467,13 @@ export class WetSurfaceEngine {
       : null
   }
 
-  setSessionStartupAuthorityContext(context = null) {
+  setSessionStartupAuthorityContext(context = null, options = null) {
+    if (!this.isInternalBoundaryCall(options)) {
+      return this.rejectBoundaryInput('setSessionStartupAuthorityContext', 'internal-only-method', {
+        attemptedRuntimeSessionKey: context?.runtimeSessionKey ?? null,
+      })
+    }
+
     const input = context && typeof context === 'object' ? context : {}
     this.sessionStartupAuthority.session = {
       runtimeSessionKey: input.runtimeSessionKey != null ? String(input.runtimeSessionKey) : null,
@@ -414,9 +494,20 @@ export class WetSurfaceEngine {
       this.bootstrapInfo.refreshPath = bootPathStr === 'refresh'
       this.bootstrapInfo.publishRestartPath = bootPathStr === 'publish-restart'
     }
+
+    return {
+      accepted: true,
+      runtimeSessionKey: this.sessionStartupAuthority.session.runtimeSessionKey,
+    }
   }
 
-  setSimulationClockContext(context = null) {
+  setSimulationClockContext(context = null, options = null) {
+    if (!this.isInternalBoundaryCall(options)) {
+      return this.rejectBoundaryInput('setSimulationClockContext', 'internal-only-method', {
+        attemptedRuntimeSessionKey: context?.runtimeSessionKey ?? null,
+      })
+    }
+
     const input = context && typeof context === 'object' ? context : {}
     const nextDurationSec = Number.isFinite(Number(input.durationSec))
       ? Math.max(0.001, Number(input.durationSec))
@@ -428,10 +519,78 @@ export class WetSurfaceEngine {
         : this.simulationClockAuthority.session?.runtimeSessionKey ?? null,
       durationSec: nextDurationSec,
     }
+
+    return {
+      accepted: true,
+      runtimeSessionKey: this.simulationClockAuthority.session.runtimeSessionKey,
+      durationSec: nextDurationSec,
+    }
   }
 
   setRuntimeSessionContext(context = null) {
     const input = context && typeof context === 'object' ? context : {}
+    const runtimeSessionKey = input.runtimeSessionKey != null ? String(input.runtimeSessionKey).trim() : ''
+    const bootPath = input.bootPath != null ? String(input.bootPath) : 'unknown'
+    const publishRevision = Number(input.publishRevision)
+    const restartToken = input.restartToken != null ? String(input.restartToken).trim() : ''
+    const durationSec = Number(input.durationSec)
+    const sceneId = input.sceneId != null ? String(input.sceneId).trim() : ''
+    const timelineId = input.timelineId != null ? String(input.timelineId).trim() : ''
+    const hasRuntimeTimeline = Boolean(input.runtimeTimeline && typeof input.runtimeTimeline === 'object')
+    const hasBasePreset = Boolean(input.basePreset && typeof input.basePreset === 'object')
+
+    if (!runtimeSessionKey) {
+      return this.rejectBoundaryInput('setRuntimeSessionContext', 'missing-runtime-session-key')
+    }
+    if (!ENGINE_ALLOWED_BOOT_PATHS.has(bootPath)) {
+      return this.rejectBoundaryInput('setRuntimeSessionContext', 'invalid-boot-path', { bootPath })
+    }
+    if (!Number.isFinite(publishRevision) || publishRevision < 0) {
+      return this.rejectBoundaryInput('setRuntimeSessionContext', 'invalid-publish-revision', {
+        publishRevision: input.publishRevision,
+      })
+    }
+    if (!restartToken) {
+      return this.rejectBoundaryInput('setRuntimeSessionContext', 'missing-restart-token')
+    }
+    if (!Number.isFinite(durationSec) || durationSec <= 0) {
+      return this.rejectBoundaryInput('setRuntimeSessionContext', 'invalid-duration-sec', {
+        durationSec: input.durationSec,
+      })
+    }
+    if (!sceneId) {
+      return this.rejectBoundaryInput('setRuntimeSessionContext', 'missing-scene-id')
+    }
+    if (!timelineId) {
+      return this.rejectBoundaryInput('setRuntimeSessionContext', 'missing-timeline-id')
+    }
+    if (!hasRuntimeTimeline) {
+      return this.rejectBoundaryInput('setRuntimeSessionContext', 'missing-runtime-timeline')
+    }
+    if (!hasBasePreset) {
+      return this.rejectBoundaryInput('setRuntimeSessionContext', 'missing-base-preset')
+    }
+    if (typeof input.startupEnabled !== 'boolean') {
+      return this.rejectBoundaryInput('setRuntimeSessionContext', 'missing-startup-enabled-flag')
+    }
+    if (typeof input.steadyLiveEnabled !== 'boolean') {
+      return this.rejectBoundaryInput('setRuntimeSessionContext', 'missing-steady-live-enabled-flag')
+    }
+    if (!Number.isFinite(Number(input.updateIntervalSec)) || Number(input.updateIntervalSec) <= 0) {
+      return this.rejectBoundaryInput('setRuntimeSessionContext', 'invalid-update-interval-sec', {
+        updateIntervalSec: input.updateIntervalSec,
+      })
+    }
+
+    const activeRuntimeSessionKey = this.getActiveRuntimeSessionKey()
+    if (this.running && activeRuntimeSessionKey && activeRuntimeSessionKey !== runtimeSessionKey) {
+      return this.rejectBoundaryInput('setRuntimeSessionContext', 'mid-session-context-replacement-rejected', {
+        activeRuntimeSessionKey,
+        attemptedRuntimeSessionKey: runtimeSessionKey,
+      })
+    }
+
+    const internalOptions = this.createInternalBoundaryOptions('setRuntimeSessionContext')
     this.schedulerRuntime = createSchedulerRuntime(input.runtimeTimeline, {
       regionModel: createFourQuadrantRegionModel({ softness: 0.45 }),
       includeDiagnostics: input.includeDiagnostics === true,
@@ -442,11 +601,11 @@ export class WetSurfaceEngine {
       bootPath: input.bootPath,
       publishRevision: input.publishRevision,
       restartToken: input.restartToken,
-    })
+    }, internalOptions)
     this.setSimulationClockContext({
       runtimeSessionKey: input.runtimeSessionKey,
       durationSec: input.durationSec,
-    })
+    }, internalOptions)
     this.setStartupRuntimeContext({
       enabled: input.startupEnabled,
       runtimeSessionKey: input.runtimeSessionKey,
@@ -455,7 +614,7 @@ export class WetSurfaceEngine {
       basePreset: input.basePreset,
       includeDiagnostics: input.includeDiagnostics,
       initialApplySequence: input.initialApplySequence,
-    })
+    }, internalOptions)
     this.setSteadyLiveRuntimeContext({
       enabled: input.steadyLiveEnabled,
       runtimeSessionKey: input.runtimeSessionKey,
@@ -464,7 +623,12 @@ export class WetSurfaceEngine {
       includeDiagnostics: input.includeDiagnostics,
       updateIntervalSec: input.updateIntervalSec,
       initialApplySequence: input.initialApplySequence,
-    })
+    }, internalOptions)
+
+    return {
+      accepted: true,
+      runtimeSessionKey,
+    }
   }
 
   syncRuntimeWeatherApplySequence(nextSequence = 0) {
@@ -478,7 +642,13 @@ export class WetSurfaceEngine {
     return sequence
   }
 
-  setStartupRuntimeContext(context = null) {
+  setStartupRuntimeContext(context = null, options = null) {
+    if (!this.isInternalBoundaryCall(options)) {
+      return this.rejectBoundaryInput('setStartupRuntimeContext', 'internal-only-method', {
+        attemptedRuntimeSessionKey: context?.runtimeSessionKey ?? null,
+      })
+    }
+
     const input = context && typeof context === 'object' ? context : {}
 
     this.startupRuntimeAuthority.enabled = input.enabled !== false
@@ -501,9 +671,20 @@ export class WetSurfaceEngine {
     this.startupRuntimeAuthority.lastSampleCallSite = 'none'
 
     this.syncRuntimeWeatherApplySequence(input.initialApplySequence)
+
+    return {
+      accepted: true,
+      runtimeSessionKey: this.startupRuntimeAuthority.runtimeSessionKey,
+    }
   }
 
-  setSteadyLiveRuntimeContext(context = null) {
+  setSteadyLiveRuntimeContext(context = null, options = null) {
+    if (!this.isInternalBoundaryCall(options)) {
+      return this.rejectBoundaryInput('setSteadyLiveRuntimeContext', 'internal-only-method', {
+        attemptedRuntimeSessionKey: context?.runtimeSessionKey ?? null,
+      })
+    }
+
     const input = context && typeof context === 'object' ? context : {}
     const nextIntervalSec = Number.isFinite(Number(input.updateIntervalSec))
       ? Math.max(1 / 120, Number(input.updateIntervalSec))
@@ -528,6 +709,11 @@ export class WetSurfaceEngine {
     this.steadyLiveAuthority.lastSampleCallSite = 'none'
 
     this.syncRuntimeWeatherApplySequence(input.initialApplySequence)
+
+    return {
+      accepted: true,
+      runtimeSessionKey: this.steadyLiveAuthority.runtimeSessionKey,
+    }
   }
 
   withSchedulerInvariantHints(drivenConfig, weather) {
@@ -566,6 +752,14 @@ export class WetSurfaceEngine {
   }
 
   applyRuntimeWeatherSnapshot(options = {}) {
+    if (!this.isInternalBoundaryCall(options)) {
+      this.rejectBoundaryInput('applyRuntimeWeatherSnapshot', 'external-runtime-application-rejected', {
+        source: options?.source || 'unknown',
+        sampleCallSite: options?.sampleCallSite || 'unknown',
+      })
+      return null
+    }
+
     const basePreset = options?.basePreset || null
     const snapshot = options?.snapshot || null
     const weather = snapshot?.weather || null
@@ -586,6 +780,8 @@ export class WetSurfaceEngine {
     const hintedConfig = this.withSchedulerInvariantHints(drivenConfig, weather)
     const linkedConfig = getLinkedEffectiveConfig(hintedConfig)
     const extraTrace = options?.extraTrace && typeof options.extraTrace === 'object' ? options.extraTrace : {}
+
+    this.updateRuntimeWeatherTiming(snapshot, hintedConfig)
 
     this.enqueueRuntimeInputEnvelope({
       source,
@@ -618,8 +814,8 @@ export class WetSurfaceEngine {
         rainTrackInputs: this.summarizeRainTrackInputs(snapshot),
         ...extraTrace,
       },
-    })
-    this.consumeRuntimeInputQueueAtBoundary(applyBoundary)
+    }, this.createInternalBoundaryOptions('applyRuntimeWeatherSnapshot'))
+    this.consumeRuntimeInputQueueAtBoundary(applyBoundary, this.createInternalBoundaryOptions('applyRuntimeWeatherSnapshot'))
 
     return {
       sequence,
@@ -629,6 +825,15 @@ export class WetSurfaceEngine {
       linkedConfig,
       snapshot,
     }
+  }
+
+  updateRuntimeWeatherTiming(snapshot = null, resolvedConfig = null) {
+    const weather = snapshot?.weather || null
+
+    this.timing.runtimeAppliedSampleSec = Number(snapshot?.sampleSec || 0)
+    this.timing.runtimeSampledRainIntensity = Number(weather?.rain || 0)
+    this.timing.runtimeDrivenDropletsPerSeconds = Number(resolvedConfig?.renderer?.dropletsPerSeconds || 0)
+    this.timing.runtimeEffectiveRefillRate = Number(resolvedConfig?.surfaceWetness?.refillRate || 0)
   }
 
   resolveStartupRuntimeSamplePlan() {
@@ -726,6 +931,7 @@ export class WetSurfaceEngine {
       includeDiagnostics: authority.includeDiagnostics,
     })
     const applied = this.applyRuntimeWeatherSnapshot({
+      __boundaryOrigin: ENGINE_BOUNDARY_INTERNAL_ORIGIN,
       basePreset: authority.basePreset,
       source: 'engine:startup-authority',
       phaseTag: plan.startupPhaseTag,
@@ -818,6 +1024,7 @@ export class WetSurfaceEngine {
     }
 
     const applied = this.applyRuntimeWeatherSnapshot({
+      __boundaryOrigin: ENGINE_BOUNDARY_INTERNAL_ORIGIN,
       basePreset: authority.basePreset,
       source: 'engine:steady-live-authority',
       phaseTag: 'non-startup',
@@ -886,8 +1093,23 @@ export class WetSurfaceEngine {
   }
 
   resetSimulationClock(options = {}) {
+    const requestedRuntimeSessionKey = options?.runtimeSessionKey != null ? String(options.runtimeSessionKey) : null
+    if (!this.hasValidExternalRuntimeSession(requestedRuntimeSessionKey)) {
+      return this.rejectBoundaryInput('resetSimulationClock', 'missing-or-stale-runtime-session', {
+        requestedRuntimeSessionKey,
+      })
+    }
+    if (this.sessionStartupAuthority.currentPhase === ENGINE_SESSION_STARTUP_PHASES.STOPPED) {
+      return this.rejectBoundaryInput('resetSimulationClock', 'reset-command-rejected-while-stopped')
+    }
+
     const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Number(performance.now() || 0)
     const reason = String(options.reason || 'reset')
+    if (options.startSec != null && !Number.isFinite(Number(options.startSec))) {
+      return this.rejectBoundaryInput('resetSimulationClock', 'invalid-start-sec', {
+        startSec: options.startSec,
+      })
+    }
     const startSec = Number.isFinite(Number(options.startSec)) ? Math.max(0, Number(options.startSec)) : 0
 
     this.simulationClockAuthority.anchorNowMs = nowMs
@@ -907,9 +1129,29 @@ export class WetSurfaceEngine {
       phase: this.simulationClockAuthority.phase,
       startupPhase: this.simulationClockAuthority.startupPhaseAtLastUpdate,
     })
+
+    return {
+      accepted: true,
+      currentTimeSec: this.simulationClockAuthority.currentTimeSec,
+    }
   }
 
   seekSimulationClock(targetSec, options = {}) {
+    const requestedRuntimeSessionKey = options?.runtimeSessionKey != null ? String(options.runtimeSessionKey) : null
+    if (!this.isInternalBoundaryCall(options) && !this.hasValidExternalRuntimeSession(requestedRuntimeSessionKey)) {
+      return this.rejectBoundaryInput('seekSimulationClock', 'missing-or-stale-runtime-session', {
+        requestedRuntimeSessionKey,
+      })
+    }
+    if (!this.isInternalBoundaryCall(options) && this.sessionStartupAuthority.currentPhase === ENGINE_SESSION_STARTUP_PHASES.STOPPED) {
+      return this.rejectBoundaryInput('seekSimulationClock', 'seek-command-rejected-while-stopped')
+    }
+    if (!Number.isFinite(Number(targetSec))) {
+      return this.rejectBoundaryInput('seekSimulationClock', 'invalid-target-sec', {
+        targetSec,
+      })
+    }
+
     const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Number(performance.now() || 0)
     const lockAtTarget = options.lockAtTarget === true
     const reason = String(options.reason || 'seek')
@@ -942,6 +1184,12 @@ export class WetSurfaceEngine {
       phase: this.simulationClockAuthority.phase,
       startupPhase: this.simulationClockAuthority.startupPhaseAtLastUpdate,
     })
+
+    return {
+      accepted: true,
+      targetSec: clampedSec,
+      lockAtTarget,
+    }
   }
 
   sampleSimulationClock(nowMs = performance.now()) {
@@ -1122,17 +1370,6 @@ export class WetSurfaceEngine {
     const sampleCallSite = String(trace.sampleCallSite || '')
     const startupPhaseTag = String(trace.startupPhaseTag || '')
 
-    if (this.sessionStartupAuthority.owner === 'engine' && !sampleCallSite.startsWith('engine:')) {
-      this.sessionStartupAuthority.compatibilityDemotedTraceCount += 1
-      this.sessionStartupAuthority.lastDemotedTrace = {
-        sampleCallSite,
-        startupPhaseTag,
-        atWetnessFrameCounter: Number(this.wetnessFrameCounter || 0),
-        atPerfNowMs: Number(performance.now() || 0),
-      }
-      return
-    }
-
     if (startupPhaseTag === 'canonical-bootstrap' || sampleCallSite.startsWith('start:')) {
       this.advanceSessionStartupPhase(ENGINE_SESSION_STARTUP_PHASES.CANONICAL_BOOTSTRAP_APPLIED, sampleCallSite || startupPhaseTag)
       return
@@ -1140,8 +1377,6 @@ export class WetSurfaceEngine {
 
     if (
       startupPhaseTag === 'pre-live-hold' ||
-      sampleCallSite === 'updateAtmosphere:canonical-zero-handoff' ||
-      sampleCallSite === 'updateAtmosphere:startup-frame0-hold' ||
       sampleCallSite === 'engine:startup-canonical-zero-handoff' ||
       sampleCallSite === 'engine:startup-frame0-hold'
     ) {
@@ -1151,7 +1386,6 @@ export class WetSurfaceEngine {
 
     if (
       startupPhaseTag === 'first-live-boundary' ||
-      sampleCallSite === 'onStats:startup-first-live-boundary' ||
       sampleCallSite === 'engine:startup-first-live-boundary'
     ) {
       this.advanceSessionStartupPhase(ENGINE_SESSION_STARTUP_PHASES.FIRST_LIVE_BOUNDARY_REACHED, sampleCallSite || startupPhaseTag)
@@ -1160,7 +1394,6 @@ export class WetSurfaceEngine {
 
     if (
       startupPhaseTag === 'startup-frame-sync' ||
-      sampleCallSite === 'updateAtmosphere:startup-frame-sync' ||
       sampleCallSite === 'engine:startup-frame-sync'
     ) {
       return
@@ -1168,7 +1401,6 @@ export class WetSurfaceEngine {
 
     if (
       startupPhaseTag === 'non-startup' ||
-      sampleCallSite === 'updateAtmosphere:getPresentationTimeSec' ||
       sampleCallSite === 'engine:steady-live-scheduler-sample'
     ) {
       if (this.sessionStartupAuthority.flags.sawFirstLiveBoundary) {
@@ -1196,10 +1428,6 @@ export class WetSurfaceEngine {
       },
       lastTransition: this.sessionStartupAuthority.lastTransition
         ? { ...this.sessionStartupAuthority.lastTransition }
-        : null,
-      compatibilityDemotedTraceCount: Number(this.sessionStartupAuthority.compatibilityDemotedTraceCount || 0),
-      lastDemotedTrace: this.sessionStartupAuthority.lastDemotedTrace
-        ? { ...this.sessionStartupAuthority.lastDemotedTrace }
         : null,
       phaseHistory: Array.isArray(this.sessionStartupAuthority.phaseHistory)
         ? this.sessionStartupAuthority.phaseHistory.map((entry) => ({ ...entry }))
@@ -1252,7 +1480,42 @@ export class WetSurfaceEngine {
     }
   }
 
-  enqueueRuntimeInputEnvelope(input = {}) {
+  enqueueRuntimeInputEnvelope(input = {}, options = null) {
+    if (!this.isInternalBoundaryCall(options)) {
+      return this.rejectBoundaryInput('enqueueRuntimeInputEnvelope', 'external-runtime-envelope-rejected', {
+        source: input?.source || 'unknown',
+        applyBoundary: input?.applyBoundary || 'unknown',
+      })
+    }
+
+    const source = String(input?.source || 'unknown')
+    const applyBoundary = String(input?.applyBoundary || 'unknown')
+    if (!ENGINE_ALLOWED_RUNTIME_ENVELOPE_SOURCES.has(source)) {
+      return this.rejectBoundaryInput('enqueueRuntimeInputEnvelope', 'invalid-envelope-source', {
+        source,
+      })
+    }
+    if (!ENGINE_ALLOWED_RUNTIME_APPLY_BOUNDARIES.has(applyBoundary)) {
+      return this.rejectBoundaryInput('enqueueRuntimeInputEnvelope', 'invalid-envelope-apply-boundary', {
+        applyBoundary,
+      })
+    }
+
+    const envelopeRuntimeSessionKey = input?.runtimeSessionKey != null ? String(input.runtimeSessionKey) : null
+    const activeRuntimeSessionKey = this.getActiveRuntimeSessionKey()
+    if (!envelopeRuntimeSessionKey) {
+      return this.rejectBoundaryInput('enqueueRuntimeInputEnvelope', 'missing-envelope-runtime-session-key', {
+        source,
+        applyBoundary,
+      })
+    }
+    if (activeRuntimeSessionKey && envelopeRuntimeSessionKey !== activeRuntimeSessionKey) {
+      return this.rejectBoundaryInput('enqueueRuntimeInputEnvelope', 'stale-envelope-runtime-session-key', {
+        activeRuntimeSessionKey,
+        envelopeRuntimeSessionKey,
+      })
+    }
+
     const envelope = this.buildRuntimeInputEnvelope(input)
     this.runtimeInputQueue.push(envelope)
     this.runtimeInputAuthority.enqueuedCount += 1
@@ -1268,15 +1531,27 @@ export class WetSurfaceEngine {
     return envelope
   }
 
-  consumeRuntimeInputQueueAtBoundary(boundary = 'presentation-update-boundary') {
+  consumeRuntimeInputQueueAtBoundary(boundary = 'presentation-update-boundary', options = null) {
+    if (!this.isInternalBoundaryCall(options)) {
+      return this.rejectBoundaryInput('consumeRuntimeInputQueueAtBoundary', 'external-runtime-queue-consume-rejected', {
+        boundary,
+      })
+    }
+
     const boundaryTag = String(boundary || 'presentation-update-boundary')
+    if (!ENGINE_ALLOWED_RUNTIME_APPLY_BOUNDARIES.has(boundaryTag)) {
+      return this.rejectBoundaryInput('consumeRuntimeInputQueueAtBoundary', 'invalid-consume-boundary', {
+        boundaryTag,
+      })
+    }
+
     if (!Array.isArray(this.runtimeInputQueue) || this.runtimeInputQueue.length === 0) {
       return null
     }
 
     const index = this.runtimeInputQueue.findIndex((envelope) => {
       const applyBoundary = String(envelope?.applyBoundary || '')
-      return applyBoundary === boundaryTag || applyBoundary === 'any'
+      return applyBoundary === boundaryTag
     })
 
     if (index < 0) {
@@ -1341,11 +1616,15 @@ export class WetSurfaceEngine {
       queueDepth: Array.isArray(this.runtimeInputQueue) ? this.runtimeInputQueue.length : 0,
       enqueuedCount: Number(this.runtimeInputAuthority.enqueuedCount || 0),
       consumedCount: Number(this.runtimeInputAuthority.consumedCount || 0),
+      rejectedCount: Number(this.runtimeInputAuthority.rejectedCount || 0),
       lastEnqueuedEnvelope: this.runtimeInputAuthority.lastEnqueuedEnvelope
         ? { ...this.runtimeInputAuthority.lastEnqueuedEnvelope }
         : null,
       lastConsumedEnvelope: this.runtimeInputAuthority.lastConsumedEnvelope
         ? { ...this.runtimeInputAuthority.lastConsumedEnvelope }
+        : null,
+      lastRejectedInput: this.runtimeInputAuthority.lastRejectedInput
+        ? { ...this.runtimeInputAuthority.lastRejectedInput }
         : null,
       recentConsumedEnvelopes: Array.isArray(this.runtimeInputAuthority.recentConsumedEnvelopes)
         ? this.runtimeInputAuthority.recentConsumedEnvelopes.map((entry) => ({ ...entry }))
@@ -1483,6 +1762,32 @@ export class WetSurfaceEngine {
     const sampleCallSite = String(input.sampleCallSite || 'start:shared-pre-start-bootstrap')
     const startupInvocationSource = String(input.startupInvocationSource || 'engine-bootstrap-authority')
 
+    if (!runtimeSessionKey) {
+      return this.rejectBoundaryInput('runCanonicalBootstrapAuthority', 'missing-runtime-session-key')
+    }
+    if (this.getActiveRuntimeSessionKey() && runtimeSessionKey !== this.getActiveRuntimeSessionKey()) {
+      return this.rejectBoundaryInput('runCanonicalBootstrapAuthority', 'stale-runtime-session-key', {
+        activeRuntimeSessionKey: this.getActiveRuntimeSessionKey(),
+        attemptedRuntimeSessionKey: runtimeSessionKey,
+      })
+    }
+    if (!schedulerRuntime || !basePreset) {
+      return this.rejectBoundaryInput('runCanonicalBootstrapAuthority', 'missing-bootstrap-dependencies', {
+        hasSchedulerRuntime: Boolean(schedulerRuntime),
+        hasBasePreset: Boolean(basePreset),
+      })
+    }
+    if (!Number.isFinite(timelineDurationSec) || timelineDurationSec <= 0) {
+      return this.rejectBoundaryInput('runCanonicalBootstrapAuthority', 'invalid-timeline-duration-sec', {
+        timelineDurationSec: input.timelineDurationSec,
+      })
+    }
+    if (!ENGINE_ALLOWED_EXTERNAL_BOOTSTRAP_CALLSITES.has(sampleCallSite)) {
+      return this.rejectBoundaryInput('runCanonicalBootstrapAuthority', 'invalid-bootstrap-sample-callsite', {
+        sampleCallSite,
+      })
+    }
+
     const bootstrap = this.resolveCanonicalPreStartBootstrap({
       schedulerRuntime,
       basePreset,
@@ -1495,6 +1800,7 @@ export class WetSurfaceEngine {
         : null
       const sequence = this.consumeRuntimeWeatherApplySequence()
       const hintedConfig = this.withSchedulerInvariantHints(bootstrap.drivenConfig, bootstrap.weather)
+      this.updateRuntimeWeatherTiming(bootstrap.preStartSnap, hintedConfig)
       this.stageTuningApplyTrace({
         sampleCallSite,
         sampleSequence: sequence,
@@ -1540,8 +1846,19 @@ export class WetSurfaceEngine {
 
   seekToBootstrapFirstRainWindow(options = {}) {
     const input = options && typeof options === 'object' ? options : {}
+    const requestedRuntimeSessionKey = input.runtimeSessionKey != null ? String(input.runtimeSessionKey) : null
+    if (!this.hasValidExternalRuntimeSession(requestedRuntimeSessionKey)) {
+      return this.rejectBoundaryInput('seekToBootstrapFirstRainWindow', 'missing-or-stale-runtime-session', {
+        requestedRuntimeSessionKey,
+      })
+    }
+    if (this.sessionStartupAuthority.currentPhase === ENGINE_SESSION_STARTUP_PHASES.STOPPED) {
+      return this.rejectBoundaryInput('seekToBootstrapFirstRainWindow', 'seek-bootstrap-command-rejected-while-stopped')
+    }
+
     const firstRainWindowSec = Number(this.startupRuntimeAuthority.firstRainWindowSec)
     if (!Number.isFinite(firstRainWindowSec) || firstRainWindowSec <= 0) {
+      this.rejectBoundaryInput('seekToBootstrapFirstRainWindow', 'missing-bootstrap-first-rain-window')
       return {
         applied: false,
         targetSec: null,
@@ -1552,6 +1869,7 @@ export class WetSurfaceEngine {
     const clampedSec = clamp(firstRainWindowSec, 0, durationSec)
     const nowMs = Number.isFinite(Number(input.nowMs)) ? Number(input.nowMs) : Number(performance.now() || 0)
     this.seekSimulationClock(clampedSec, {
+      __boundaryOrigin: ENGINE_BOUNDARY_INTERNAL_ORIGIN,
       reason: String(input.reason || 'engine-seek-bootstrap-first-rain-window'),
       lockAtTarget: input.lockAtTarget === true,
       nowMs,
@@ -1572,15 +1890,12 @@ export class WetSurfaceEngine {
       return 'canonical-bootstrap'
     }
     if (
-      sampleCallSite === 'updateAtmosphere:startup-frame-sync' ||
       sampleCallSite === 'engine:startup-frame-sync' ||
       startupPhaseTag === 'startup-frame-sync'
     ) {
       return 'startup-frame-sync'
     }
     if (
-      sampleCallSite === 'updateAtmosphere:canonical-zero-handoff' ||
-      sampleCallSite === 'updateAtmosphere:startup-frame0-hold' ||
       sampleCallSite === 'engine:startup-canonical-zero-handoff' ||
       sampleCallSite === 'engine:startup-frame0-hold' ||
       startupPhaseTag === 'pre-live-hold'
@@ -1588,17 +1903,10 @@ export class WetSurfaceEngine {
       return 'pre-live-hold'
     }
     if (
-      sampleCallSite === 'onStats:startup-first-live-boundary' ||
       sampleCallSite === 'engine:startup-first-live-boundary' ||
       startupPhaseTag === 'first-live-boundary'
     ) {
       return 'first-live-boundary'
-    }
-    if (sampleCallSite === 'engine:bootstrap-seed' || startupPhaseTag === 'engine-seed') {
-      return 'engine-seed'
-    }
-    if (sampleCallSite === 'engine:bootstrap-reapply' || startupPhaseTag === 'bootstrap-reapply') {
-      return 'bootstrap-reapply'
     }
 
     return sampleCallSite ? `other:${sampleCallSite}` : 'other:unstaged'
@@ -4752,6 +5060,10 @@ export class WetSurfaceEngine {
         runtimeWeatherApplySource: this.timing.runtimeWeatherApplySource,
         runtimeWeatherApplyCallSite: this.timing.runtimeWeatherApplyCallSite,
         runtimeWeatherApplySequence: this.timing.runtimeWeatherApplySequence,
+        runtimeAppliedSampleSec: this.timing.runtimeAppliedSampleSec,
+        runtimeSampledRainIntensity: this.timing.runtimeSampledRainIntensity,
+        runtimeDrivenDropletsPerSeconds: this.timing.runtimeDrivenDropletsPerSeconds,
+        runtimeEffectiveRefillRate: this.timing.runtimeEffectiveRefillRate,
         runtimeSteadyLiveApplyCount: this.timing.runtimeSteadyLiveApplyCount,
         runtimeStartupAuthorityOwner: this.timing.runtimeStartupAuthorityOwner,
         runtimeStartupPhaseCurrent: this.timing.runtimeStartupPhaseCurrent,

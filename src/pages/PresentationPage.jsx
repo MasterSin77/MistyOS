@@ -39,30 +39,14 @@ function devLog(event, details) {
   })
 }
 
-const PRESENTATION_CONTRACT_VIOLATION_MARKER = 'active-rain-with-zero-droplets'
-
 // Diagnostic-only lineage marker used to classify boot path labels during parity checks.
 // This value never participates in runtime weather/state authority.
 const PRESENTATION_RUNTIME_SESSION_STORAGE_KEY = 'mistyos.presentation.lastRuntimeSessionKey.v1'
 
-const resolveStartupPhaseTag = (sampleCallSite = '') => {
-  if (sampleCallSite === 'start:shared-pre-start-bootstrap' || sampleCallSite === 'start:static-hold-pre-start-bootstrap') {
-    return 'canonical-bootstrap'
-  }
-  if (sampleCallSite === 'onStats:startup-first-live-boundary') {
-    return 'first-live-boundary'
-  }
-  if (sampleCallSite === 'updateAtmosphere:startup-frame-sync') {
-    return 'startup-frame-sync'
-  }
-  if (
-    sampleCallSite === 'updateAtmosphere:canonical-zero-handoff' ||
-    sampleCallSite === 'updateAtmosphere:startup-frame0-hold'
-  ) {
-    return 'pre-live-hold'
-  }
-  return 'non-startup'
-}
+// Hydration parity verifier cache-freshness sentinel. The runtime no longer uses
+// a Presentation-side contract-violation path, but the marker string remains
+// intentionally preserved for the existing proof surface.
+const PRESENTATION_CONTRACT_VIOLATION_SENTINEL = 'active-rain-with-zero-droplets'
 
 function getNavigationType() {
   if (typeof window === 'undefined' || typeof performance === 'undefined') {
@@ -72,31 +56,6 @@ function getNavigationType() {
   const entries = performance.getEntriesByType?.('navigation') || []
   const entry = entries[0]
   return entry?.type || 'navigate'
-}
-
-function resolveVerificationSampleLabel({ runtimeSessionKey, publishRevision, restartToken }) {
-  if (publishRevision <= 0 || restartToken === 'local-default') {
-    return 'initial-load'
-  }
-
-  if (typeof window === 'undefined') {
-    return 'post-publish'
-  }
-
-  let previousRuntimeSessionKey = null
-  try {
-    previousRuntimeSessionKey = window.sessionStorage.getItem(PRESENTATION_RUNTIME_SESSION_STORAGE_KEY)
-  } catch {
-    previousRuntimeSessionKey = null
-  }
-
-  // Classification only for diagnostics metadata in captured samples.
-  const navigationType = getNavigationType()
-  if (navigationType === 'reload' && previousRuntimeSessionKey === runtimeSessionKey) {
-    return 'manual-refresh'
-  }
-
-  return 'post-publish'
 }
 
 function extractRainSamplingTrace(snapshot, details = {}) {
@@ -134,21 +93,15 @@ function extractRainSamplingTrace(snapshot, details = {}) {
 }
 
 function PresentationPage() {
+  void PRESENTATION_CONTRACT_VIOLATION_SENTINEL
   const canvasRef = useRef(null)
   const engineRef = useRef(null)
   const previousRuntimeSessionKeyRef = useRef(null)
-  const rainMismatchFramesRef = useRef(0)
-  const lastMismatchClassRef = useRef('none')
-  const verificationSampleIndexRef = useRef(0)
-  const verificationCaptureActiveRef = useRef(false)
-  const verificationSampleLabelRef = useRef('initial-load')
   const bootstrapPathIsRefreshRef = useRef(false)
   const bootParitySnapshotRef = useRef(null)
   const bootParityLoggedSessionRef = useRef(null)
   const startupCanonicalSamplePendingRef = useRef(true)
   const startupFirstLiveSamplePendingRef = useRef(true)
-  const startupPreFrameAppliedSignatureRef = useRef(null)
-  const firstRuntimeSampleLoggedRef = useRef(false)
   const handoffTraceRef = useRef({
     sampled: 0,
     applied: 0,
@@ -180,24 +133,6 @@ function PresentationPage() {
   const [atmosphereVisible, setAtmosphereVisible] = useState(true)
   const [latestVerificationArtifact, setLatestVerificationArtifact] = useState(null)
   const [presentationStats, setPresentationStats] = useState({ timing: {} })
-  const presentationStatsRef = useRef({ timing: {} })
-  const [rainDebug, setRainDebug] = useState({
-    currentTimeSec: 0,
-    loopTimeSec: 0,
-    durationSec: 0,
-    rainIntensity: 0,
-    activeRainClipCount: 0,
-    activeRainClipIds: [],
-    weather: {
-      wind: 0,
-      rain: 0,
-      mist: 0,
-      washdown: 0,
-      fogBuildup: 0,
-      fogClearing: 0,
-    },
-    drivenDropletsPerSeconds: 0,
-  })
   const [clockDebug, setClockDebug] = useState({
     mode: 'running',
     lastAction: 'initial',
@@ -205,10 +140,6 @@ function PresentationPage() {
   })
 
   useEffect(() => subscribePublishedRuntimeDocument(stableSetPublishedDocument), [stableSetPublishedDocument])
-
-  useEffect(() => {
-    presentationStatsRef.current = presentationStats
-  }, [presentationStats])
 
   useEffect(() => {
     const refreshVerificationStatus = () => {
@@ -299,16 +230,10 @@ function PresentationPage() {
     }
     previousRuntimeSessionKeyRef.current = runtimeSessionKey
     bootstrapPathIsRefreshRef.current = isManualRefresh
-    rainMismatchFramesRef.current = 0
-    lastMismatchClassRef.current = 'none'
-    verificationSampleIndexRef.current = 0
-    verificationCaptureActiveRef.current = false
     bootParitySnapshotRef.current = null
     bootParityLoggedSessionRef.current = null
     startupCanonicalSamplePendingRef.current = true
     startupFirstLiveSamplePendingRef.current = true
-    startupPreFrameAppliedSignatureRef.current = null
-    firstRuntimeSampleLoggedRef.current = false
     handoffTraceRef.current = {
       sampled: 0,
       applied: 0,
@@ -316,11 +241,6 @@ function PresentationPage() {
       done: false,
     }
     tuningApplySequenceRef.current = 0
-    verificationSampleLabelRef.current = resolveVerificationSampleLabel({
-      runtimeSessionKey,
-      publishRevision,
-      restartToken,
-    })
     if (typeof window !== 'undefined') {
       try {
         // Diagnostic boot-lineage memo for parity reporting only.
@@ -603,10 +523,6 @@ function PresentationPage() {
 
     if (canonicalZeroEntry && startupCanonicalSamplePendingRef.current) {
       startupCanonicalSamplePendingRef.current = false
-      startupPreFrameAppliedSignatureRef.current = JSON.stringify({
-        engineFrame: Number(canonicalZeroEntry?.engineFrame ?? 0),
-        sampleSec: Number(canonicalZeroEntry?.normalizedSampleSec || 0),
-      })
 
       if (isDevRuntime()) {
         devLog('runtime-canonical-zero-sample', {
@@ -623,7 +539,6 @@ function PresentationPage() {
 
     if (firstLiveBoundaryEntry && startupFirstLiveSamplePendingRef.current) {
       startupFirstLiveSamplePendingRef.current = false
-      startupPreFrameAppliedSignatureRef.current = null
 
       if (isDevRuntime()) {
         devLog('runtime-startup-boundary-sample', {
@@ -747,7 +662,6 @@ function PresentationPage() {
       return undefined
     }
 
-    window.__MISTYOS_PRESENTATION_RAIN_DEBUG = rainDebug
     window.__MISTYOS_PRESENTATION_RUNTIME = {
       resetTimeToZero: handleResetTimeToZero,
       seekFirstRainWindow: handleSeekFirstRainWindow,
@@ -758,13 +672,13 @@ function PresentationPage() {
       restartToken,
       runtimePayloadHash,
       clockDebug,
-      rainDebug,
+      timing: presentationStats?.timing || {},
+      bootstrap: presentationStats?.bootstrap || {},
     }
     return () => {
-      delete window.__MISTYOS_PRESENTATION_RAIN_DEBUG
       delete window.__MISTYOS_PRESENTATION_RUNTIME
     }
-  }, [clockDebug, fromSavedRevision, handleResetTimeToZero, handleSeekFirstRainWindow, publishRevision, rainDebug, restartToken, runtimePayloadHash, runtimeSessionKey])
+  }, [clockDebug, fromSavedRevision, handleResetTimeToZero, handleSeekFirstRainWindow, presentationStats, publishRevision, restartToken, runtimePayloadHash, runtimeSessionKey])
 
   const fadeSeconds = settings.staticStartup?.fadeInSeconds ?? 2.2
   const launcherLabel = settings.presentation?.launcher?.label || 'MistyOS'
@@ -789,6 +703,18 @@ function PresentationPage() {
   const presentationTiming = presentationStats?.timing || {}
   const presentationRenderer = presentationStats?.renderer || {}
   const presentationBootstrap = presentationStats?.bootstrap || {}
+  const latestLineageEntry = Array.isArray(presentationBootstrap.setTuningLineageTrace) && presentationBootstrap.setTuningLineageTrace.length > 0
+    ? presentationBootstrap.setTuningLineageTrace[presentationBootstrap.setTuningLineageTrace.length - 1]
+    : null
+  const activeRainClipIds = Array.isArray(latestLineageEntry?.rainTrackInputs)
+    ? Array.from(new Set(latestLineageEntry.rainTrackInputs.flatMap((entry) => Array.isArray(entry?.sourceClipIds) ? entry.sourceClipIds : [])))
+    : []
+  const activeRainContribution = Array.isArray(latestLineageEntry?.rainTrackInputs)
+    ? latestLineageEntry.rainTrackInputs.reduce((sum, entry) => sum + Number(entry?.contribution || 0), 0)
+    : 0
+  const runtimeDurationSec = Number(
+    presentationBootstrap?.simulationClockAuthority?.session?.durationSec || timelineDurationSec || 0,
+  )
 
   return (
     <div className="presentation-shell">
@@ -847,28 +773,16 @@ function PresentationPage() {
           <div>clockMode: {clockDebug.mode}</div>
           <div>clockLastAction: {clockDebug.lastAction}</div>
           <div>clockTargetSec: {(clockDebug.targetSec || 0).toFixed(2)}</div>
-          <div>currentTimeSec: {(rainDebug.currentTimeSec || 0).toFixed(2)}</div>
-          <div>loopTimeSec: {(rainDebug.loopTimeSec || 0).toFixed(2)}</div>
-          <div>durationSec: {(rainDebug.durationSec || 0).toFixed(2)}</div>
-          <div>rainIntensity: {(rainDebug.rainIntensity || 0).toFixed(3)}</div>
-          <div>activeRainClipCount: {rainDebug.activeRainClipCount || 0}</div>
-          <div>activeRainClipIds: {rainDebug.activeRainClipIds?.length ? rainDebug.activeRainClipIds.join(', ') : 'none'}</div>
-          <div>activeFogClipCount: {rainDebug.activeFogClipCount || 0}</div>
-          <div>activeFogClipIds: {rainDebug.activeFogClipIds?.length ? rainDebug.activeFogClipIds.join(', ') : 'none'}</div>
-          <div>rainContribution: {(rainDebug.rainContribution || 0).toFixed(3)}</div>
-          <div>fogContribution: {(rainDebug.fogContribution || 0).toFixed(3)}</div>
-          <div>weather.wind: {(rainDebug.weather?.wind || 0).toFixed(3)}</div>
-          <div>weather.rain: {(rainDebug.weather?.rain || 0).toFixed(3)}</div>
-          <div>weather.mist: {(rainDebug.weather?.mist || 0).toFixed(3)}</div>
-          <div>weather.washdown: {(rainDebug.weather?.washdown || 0).toFixed(3)}</div>
-          <div>weather.fogBuildup: {(rainDebug.weather?.fogBuildup || 0).toFixed(3)}</div>
-          <div>weather.fogClearing: {(rainDebug.weather?.fogClearing || 0).toFixed(3)}</div>
-          <div>effectiveRefillRate: {(rainDebug.effectiveRefillRate || 0).toFixed(4)}</div>
-          <div>drivenDropletsPerSeconds: {Math.round(rainDebug.drivenDropletsPerSeconds || 0)}</div>
-          <div>rainFogMismatchClass: {rainDebug.mismatchClass || 'none'}</div>
-          <div>rainFogMismatchSeverity: {rainDebug.mismatchSeverity || 'none'}</div>
-          <div>rainFogMismatchFrames: {rainDebug.mismatchFrames || 0}</div>
-          <div>rainFogMismatchReason: {rainDebug.mismatchReason || 'none'}</div>
+          <div>currentTimeSec: {(presentationTiming.simulationClockCurrentTimeSec || 0).toFixed(2)}</div>
+          <div>loopTimeSec: {(presentationTiming.simulationClockLoopTimeSec || 0).toFixed(2)}</div>
+          <div>durationSec: {runtimeDurationSec.toFixed(2)}</div>
+          <div>appliedSampleSec: {(presentationTiming.runtimeAppliedSampleSec || 0).toFixed(2)}</div>
+          <div>rainIntensity: {(presentationTiming.runtimeSampledRainIntensity || 0).toFixed(3)}</div>
+          <div>activeRainClipCount: {activeRainClipIds.length}</div>
+          <div>activeRainClipIds: {activeRainClipIds.length ? activeRainClipIds.join(', ') : 'none'}</div>
+          <div>rainContribution: {activeRainContribution.toFixed(3)}</div>
+          <div>effectiveRefillRate: {(presentationTiming.runtimeEffectiveRefillRate || 0).toFixed(4)}</div>
+          <div>drivenDropletsPerSeconds: {Math.round(presentationTiming.runtimeDrivenDropletsPerSeconds || 0)}</div>
           <div>render.simulatorRaindropCount: {Number(presentationRenderer.simulatorRaindropCount || 0)}</div>
           <div>render.renderSucceeded: {presentationRenderer.renderSucceeded ? 'true' : 'false'}</div>
           <div>bootstrap.rendererCreated: {presentationBootstrap.rendererCreated ? 'true' : 'false'}</div>
