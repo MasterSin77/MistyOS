@@ -662,10 +662,13 @@ function PresentationPage() {
       return undefined
     }
 
+    // Non-authoritative engine ref export for dev-mode boundary rejection testing only.
+    // This is strictly for verification; production runtime authority flows through handlers.
     window.__MISTYOS_PRESENTATION_RUNTIME = {
       resetTimeToZero: handleResetTimeToZero,
       seekFirstRainWindow: handleSeekFirstRainWindow,
       engineContractMarker: 'withSchedulerInvariantHints',
+      __devEngineRef: engineRef.current,
       runtimeSessionKey,
       publishRevision,
       fromSavedRevision,
@@ -678,7 +681,7 @@ function PresentationPage() {
     return () => {
       delete window.__MISTYOS_PRESENTATION_RUNTIME
     }
-  }, [clockDebug, fromSavedRevision, handleResetTimeToZero, handleSeekFirstRainWindow, presentationStats, publishRevision, restartToken, runtimePayloadHash, runtimeSessionKey])
+  }, [clockDebug, engineRef, fromSavedRevision, handleResetTimeToZero, handleSeekFirstRainWindow, presentationStats, publishRevision, restartToken, runtimePayloadHash, runtimeSessionKey])
 
   const fadeSeconds = settings.staticStartup?.fadeInSeconds ?? 2.2
   const launcherLabel = settings.presentation?.launcher?.label || 'MistyOS'
