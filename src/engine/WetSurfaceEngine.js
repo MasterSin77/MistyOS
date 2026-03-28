@@ -5,6 +5,12 @@ import { createSchedulerRuntime } from '../scheduler/runtime'
 import { createFourQuadrantRegionModel } from '../scheduler/region-model'
 import { DEFAULT_TUNING_CONFIG, deepClone, getLinkedEffectiveConfig, mergeDeep } from '../tuning/tuningConfig'
 import { buildRuntimeWeatherDrivenConfig } from '../runtime/runtimeExecution'
+import {
+  isRaindropFxBaselineSeedModeEnabledFromUrl,
+  loadRaindropFxBaselineSeedArtifact,
+  mapRaindropFxBaselineSeedToEngineConfig,
+  resolveRaindropFxBaselineSeedPathFromUrl,
+} from '../runtime/raindropfxBaselineSeedMode'
 
 const ENGINE_SESSION_STARTUP_PHASES = {
   CONSTRUCTED: 'constructed',
@@ -105,6 +111,20 @@ export class WetSurfaceEngine {
     this.pointerActive = false
     this.lastPointer = null
     this.pointerPhase = Math.random() * Math.PI * 2
+
+    this.baselineSeedMode = {
+      enabled: isRaindropFxBaselineSeedModeEnabledFromUrl(),
+      seedPath: resolveRaindropFxBaselineSeedPathFromUrl(),
+      seedArtifact: null,
+      seedLoadError: null,
+      seedApplied: false,
+      authoritativeApplySignature: null,
+    }
+
+    if (this.baselineSeedMode.enabled) {
+      // Baseline mode explicitly disables writing interactions.
+      this.phase = Math.min(this.phase, 2)
+    }
 
     const query = new URLSearchParams(window.location.search)
     this.rendererDebugEnabled = query.get('rdfxDebug') === '1'
@@ -606,8 +626,12 @@ export class WetSurfaceEngine {
       runtimeSessionKey: input.runtimeSessionKey,
       durationSec: input.durationSec,
     }, internalOptions)
+    const baselineModeActive = this.baselineSeedMode.enabled === true
+    const startupEnabled = baselineModeActive ? false : input.startupEnabled
+    const steadyLiveEnabled = baselineModeActive ? false : input.steadyLiveEnabled
+
     this.setStartupRuntimeContext({
-      enabled: input.startupEnabled,
+      enabled: startupEnabled,
       runtimeSessionKey: input.runtimeSessionKey,
       sceneId: input.sceneId,
       timelineId: input.timelineId,
@@ -616,7 +640,7 @@ export class WetSurfaceEngine {
       initialApplySequence: input.initialApplySequence,
     }, internalOptions)
     this.setSteadyLiveRuntimeContext({
-      enabled: input.steadyLiveEnabled,
+      enabled: steadyLiveEnabled,
       runtimeSessionKey: input.runtimeSessionKey,
       timelineId: input.timelineId,
       basePreset: input.basePreset,
@@ -1750,6 +1774,15 @@ export class WetSurfaceEngine {
   }
 
   runCanonicalBootstrapAuthority(options = {}) {
+    if (this.baselineSeedMode.enabled) {
+      return {
+        applied: false,
+        skipped: true,
+        reason: 'baseline-seed-mode-active',
+        runtimeSessionKey: this.getActiveRuntimeSessionKey(),
+      }
+    }
+
     const input = options && typeof options === 'object' ? options : {}
     const runtimeSessionKey = input.runtimeSessionKey != null
       ? String(input.runtimeSessionKey)
@@ -1971,6 +2004,22 @@ export class WetSurfaceEngine {
       : null
     this.pendingTuningApplyTrace = null
 
+    const applySignature = JSON.stringify({
+      sampleCallSite: String(stagedApplyTrace?.sampleCallSite || 'manual-setTuningConfig'),
+      startupInvocationSource: String(stagedApplyTrace?.startupInvocationSource || 'none'),
+      startupPhaseTag: String(stagedApplyTrace?.startupPhaseTag || 'non-startup'),
+    })
+    if (
+      this.baselineSeedMode.enabled
+      && this.baselineSeedMode.seedApplied
+      && applySignature !== this.baselineSeedMode.authoritativeApplySignature
+    ) {
+      this.rejectBoundaryInput('setTuningConfig', 'baseline-seed-authority-lock', {
+        blockedApplySignature: applySignature,
+      })
+      return
+    }
+
     this.integrationCounters.setTuningConfigCalls += 1
     const merged = mergeDeep(DEFAULT_TUNING_CONFIG, nextConfig || {})
     const signature = JSON.stringify(merged)
@@ -2005,6 +2054,8 @@ export class WetSurfaceEngine {
     this.recordWetnessLifecycleTrace('setTuningConfig-applied', {
       sampledRainIntensity: Number(this.tuningConfig?.debug?.runtimeSampledRainIntensity || 0),
       dropletsPerSeconds: Number(this.tuningConfig?.renderer?.dropletsPerSeconds || 0),
+      baselineSeedModeEnabled: Boolean(this.baselineSeedMode.enabled),
+      baselineSeedApplied: Boolean(this.baselineSeedMode.seedApplied),
       ...(stagedApplyTrace || {}),
     })
   }
@@ -2098,6 +2149,7 @@ export class WetSurfaceEngine {
     }
 
     const attachBeforeFirstTick = async () => {
+      await this.initializeRaindropFxBaselineSeedModeIfNeeded()
       await this.initializeRaindropRenderer()
       // Guard: if a renderer exists but did not attach, retry immediately.
       if (this.raindropRenderer && !this.raindropRendererReady) {
@@ -2114,6 +2166,57 @@ export class WetSurfaceEngine {
     attachBeforeFirstTick().finally(() => {
       beginAnimationLoop()
     })
+  }
+
+  async initializeRaindropFxBaselineSeedModeIfNeeded() {
+    if (!this.baselineSeedMode.enabled || this.baselineSeedMode.seedApplied) {
+      return
+    }
+
+    let seed = null
+    let mappedConfig = null
+    try {
+      seed = await loadRaindropFxBaselineSeedArtifact(this.baselineSeedMode.seedPath)
+      mappedConfig = mapRaindropFxBaselineSeedToEngineConfig(seed, {
+        width: this.width || 1920,
+        height: this.height || 1080,
+      })
+    } catch (error) {
+      this.baselineSeedMode.seedLoadError = error instanceof Error ? error.message : String(error)
+      throw error
+    }
+
+    const authoritativeTrace = {
+      sampleCallSite: 'baseline-seed:authoritative-load',
+      startupInvocationSource: 'raindropfx-baseline-seed-mode',
+      startupPhaseTag: 'canonical-bootstrap',
+      startupSequenceIndex: -1,
+      startupEngineFrame: Number(this.wetnessFrameCounter || 0),
+      startupWetnessFrameCounter: Number(this.timing?.wetnessFrameCounter || this.wetnessFrameCounter || 0),
+      startupPacketId: -1,
+      rawElapsedSec: 0,
+      normalizedSampleSec: 0,
+      sampledRainIntensityBeforeDerive: 0,
+      derivedRainIntensity: Number(mappedConfig?.renderer?.rainIntensity || 0),
+      derivedDropletsPerSeconds: Number(mappedConfig?.renderer?.dropletsPerSeconds || 0),
+      rainTrackInputs: [],
+    }
+
+    this.baselineSeedMode.seedArtifact = seed
+    this.baselineSeedMode.seedLoadError = null
+    this.baselineSeedMode.authoritativeApplySignature = JSON.stringify({
+      sampleCallSite: authoritativeTrace.sampleCallSite,
+      startupInvocationSource: authoritativeTrace.startupInvocationSource,
+      startupPhaseTag: authoritativeTrace.startupPhaseTag,
+    })
+
+    this.stageTuningApplyTrace(authoritativeTrace)
+    this.setTuningConfig(mappedConfig)
+    this.baselineSeedMode.seedApplied = true
+    this.timing.runtimeWeatherApplyAuthority = 'baseline-seed-mode'
+    this.timing.runtimeWeatherApplySource = 'engine:baseline-seed-authority'
+    this.timing.runtimeWeatherApplyCallSite = authoritativeTrace.sampleCallSite
+    this.timing.runtimeWeatherApplySequence = -1
   }
 
   stop() {
@@ -2171,6 +2274,10 @@ export class WetSurfaceEngine {
     })
 
     this.raindropRenderer = adapter
+    // Expose engine ref for debugging and validation capture
+    if (typeof window !== 'undefined') {
+      window.__wet_surface_engine_ref = this
+    }
     this.bootstrapInfo.rendererCreated = true
     if (this._isDevEnv) {
       console.info('[MistyOS][Engine][bootstrap-seq]', {
@@ -2272,6 +2379,10 @@ export class WetSurfaceEngine {
   }
 
   onPointerDown(event) {
+    if (this.baselineSeedMode.enabled) {
+      return
+    }
+
     if (this.phase < 3) {
       return
     }
@@ -2283,6 +2394,10 @@ export class WetSurfaceEngine {
   }
 
   onPointerMove(event) {
+    if (this.baselineSeedMode.enabled) {
+      return
+    }
+
     if (!this.pointerActive || this.phase < 3) {
       return
     }
@@ -2299,6 +2414,10 @@ export class WetSurfaceEngine {
   }
 
   onPointerUp() {
+    if (this.baselineSeedMode.enabled) {
+      return
+    }
+
     this.pointerActive = false
     this.lastPointer = null
     this.isWriting = false
@@ -4677,6 +4796,9 @@ export class WetSurfaceEngine {
       this.rendererDebugInfo.renderCalled = true
       this.rendererDebugInfo.renderSucceeded = this.raindropRenderer?.update({ dt, total: now / 1000 }) ?? false
       simulatorSnapshot = this.raindropRenderer?.getSimulatorSnapshot?.() ?? []
+      if (this.baselineSeedMode.enabled) {
+        this.raindropRenderer?.recordBaselineSeedFrameSample?.(this.wetnessFrameCounter, now / 1000)
+      }
       this.sampleRendererFrameEnergy()
       rendererMs = performance.now() - rendererStart
     } else if (this.phase >= 2 && this.tuningConfig.debug.freezeRain) {
@@ -4937,6 +5059,14 @@ export class WetSurfaceEngine {
         freezeRain: this.tuningConfig.debug.freezeRain,
         freezeBackground: this.tuningConfig.debug.freezeBackground,
         nativeSimulatorPath: true,
+        baselineSeedModeEnabled: Boolean(this.baselineSeedMode.enabled),
+        baselineSeedApplied: Boolean(this.baselineSeedMode.seedApplied),
+        baselineSeedId: this.baselineSeedMode.seedArtifact?.identity?.seedId || null,
+        baselineSeedPath: this.baselineSeedMode.seedPath || null,
+        baselineSeedLoadError: this.baselineSeedMode.seedLoadError || null,
+        baselineSeedDiagnosticsReport: this.baselineSeedMode.enabled
+          ? (this.raindropRenderer?.getBaselineSeedDiagnosticsReport?.() ?? null)
+          : null,
       },
       timing: {
         avgFrameMs: this.timing.avgFrameMs,

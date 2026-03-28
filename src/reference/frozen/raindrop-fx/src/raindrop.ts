@@ -14,6 +14,13 @@ export class RainDrop
     grid?: CollisionGrid;
     gridIdx?: number;
 
+    /** True while this drop is in runner state (reduced resistance, set by split). */
+    isRunner = false;
+    /** Seconds remaining in runner state. */
+    runnerTimeRemaining = 0;
+    /** Frames remaining before this drop can participate in a merge again. */
+    mergeCooldownFrames = 0;
+
     private _mass: number = 0;
     private _size: vec2 = vec2.zero();
     private simulator: RaindropSimulator;
@@ -68,8 +75,41 @@ export class RainDrop
             this.randomMotion();
         }
 
-        this.mass -= this.simulator.options.evaporate * time.dt;
-        const force = this.options.gravity * this.mass - this.resistance;
+        // Runner persistence timer: tick down and clear runner state when expired
+        if (this.isRunner && this.runnerTimeRemaining > 0) {
+            this.runnerTimeRemaining -= time.dt;
+            if (this.runnerTimeRemaining <= 0) {
+                this.isRunner = false;
+                this.runnerTimeRemaining = 0;
+            }
+        }
+
+        // Optional runner termination by mass threshold
+        if (this.isRunner && this.simulator.options.runnerTerminationMassThreshold && this.simulator.options.runnerTerminationMassThreshold > 0) {
+            if (this.mass < this.simulator.options.runnerTerminationMassThreshold) {
+                this.isRunner = false;
+                this.runnerTimeRemaining = 0;
+            }
+        }
+
+        // Trail drops (parent !== undefined) can use a separate evaporate rate
+        const evaporateRate = (this.parent !== undefined && this.simulator.options.trailEvaporate !== undefined)
+            ? this.simulator.options.trailEvaporate
+            : this.simulator.options.evaporate;
+        this.mass -= evaporateRate * time.dt;
+
+        // Piecewise gravity multiplier by drop size (first matching band wins)
+        let gravityMultiplier = 1;
+        const bands = this.options.velocityGravityBands;
+        if (bands && bands.length > 0) {
+            for (const band of bands) {
+                if (this.size.x <= band.maxSize) {
+                    gravityMultiplier = band.multiplier;
+                    break;
+                }
+            }
+        }
+        const force = this.options.gravity * gravityMultiplier * this.mass - this.resistance;
         const acceleration = force / this.mass;
         this.velocity.y -= acceleration * time.dt;
         if (this.velocity.y > 0)
@@ -81,8 +121,12 @@ export class RainDrop
 
         const spreadByVelocity = this.simulator.options.velocitySpread * 2 * Math.atan(Math.abs(this.velocity.y * 0.005)) / Math.PI;
         this.spread.y = Math.max(this.spread.y, spreadByVelocity);
-        this.spread.x *= Math.pow(this.simulator.options.shrinkRate, time.dt);
-        this.spread.y *= Math.pow(this.simulator.options.shrinkRate, time.dt);
+        // Trail drops can use a separate shrink rate
+        const shrinkRateEff = (this.parent !== undefined && this.simulator.options.trailShrinkRate !== undefined)
+            ? this.simulator.options.trailShrinkRate
+            : this.simulator.options.shrinkRate;
+        this.spread.x *= Math.pow(shrinkRateEff, time.dt);
+        this.spread.y *= Math.pow(shrinkRateEff, time.dt);
         // this.spread.y +=  Math.abs(this.velocity.y) * 0.0001;
 
         if (Vector2.distanceSquared(this.lastTrailPos, this.pos) > this.nextTrailDistance * this.nextTrailDistance)
@@ -94,7 +138,11 @@ export class RainDrop
     split()
     {
         // return;
-        if (this.mass < 1000)
+        const massThreshold = this.simulator.options.runnerSplitMassThreshold ?? 1000;
+        if (this.mass < massThreshold)
+            return;
+        const splitProb = this.simulator.options.runnerSplitProbability ?? 1;
+        if (splitProb < 1 && Math.random() >= splitProb)
             return;
         let size = this.size.x * randomRange(...this.simulator.options.trailDropSize);
         const pos = plus(vec2(randomRange(-5, 5), this.size.y / 4), this.pos);
@@ -105,11 +153,23 @@ export class RainDrop
         this.simulator.add(trailDrop);
         this.lastTrailPos = this.pos.clone();
         this.nextTrailDistance = randomRange(...this.simulator.options.trailDistance);
+
+        // Mark this (parent) drop as a runner after a successful split
+        const persistMin = this.simulator.options.runnerPersistenceMin ?? 0;
+        const persistMax = this.simulator.options.runnerPersistenceMax ?? 0;
+        if (persistMax > 0) {
+            this.isRunner = true;
+            this.runnerTimeRemaining = persistMin + Math.random() * (persistMax - persistMin);
+        }
     }
 
     randomMotion()
     {
-        const maxResistance = lerp(...this.simulator.options.spawnSize, 1 - this.simulator.options.slipRate) ** 2 * 4;
+        // Runner drops get reduced resistance (higher effective speed)
+        const speedMultiplier = (this.isRunner && this.simulator.options.runnerSpeedMultiplier !== undefined)
+            ? this.simulator.options.runnerSpeedMultiplier
+            : 1;
+        const maxResistance = lerp(...this.simulator.options.spawnSize, 1 - this.simulator.options.slipRate) ** 2 * 4 / speedMultiplier;
         this.resistance = randomRange(0, 1) * this.options.gravity * maxResistance;
         this.shifting = random() * randomRange(...this.simulator.options.xShifting);
     }
@@ -121,5 +181,10 @@ export class RainDrop
         const momentum = plus(selfMomentum, targetMomentum);
         this.mass += target.mass;
         this.velocity = div(momentum, this.mass);
+
+        // Apply optional post-merge growth boost
+        if (this.simulator.options.postMergeGrowthMultiplier && this.simulator.options.postMergeGrowthMultiplier > 1) {
+            this.velocity = mul(this.velocity, this.simulator.options.postMergeGrowthMultiplier);
+        }
     }
 }

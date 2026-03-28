@@ -77,6 +77,69 @@ export interface SimulatorOptions
      * Gravity acceleration in pixels/s. Recommend 2400
      */
     gravity: number;
+
+    // ---- Extended option surface (all optional; defaults preserve original behavior) ----
+
+    /**
+     * Minimum drop mass for the runner split gate. Defaults to 1000 (original hardcoded value).
+     * mass = (size * density)^2. Map normalized 0-1 seed thresholds via lerp(spawnSize[0]^2, spawnSize[1]^2, t).
+     */
+    runnerSplitMassThreshold?: number;
+    /**
+     * Probability (0..1) that a split fires when the mass gate passes. Default 1 (always).
+     */
+    runnerSplitProbability?: number;
+    /**
+     * Resistance divisor applied to the parent drop while it is in runner state.
+     * Values >1 reduce effective resistance → faster slide. Default 1 (no boost).
+     */
+    runnerSpeedMultiplier?: number;
+    /**
+     * Minimum runner-state duration in seconds (parent drop, post-split). Default 0 (no persistence).
+     */
+    runnerPersistenceMin?: number;
+    /**
+     * Maximum runner-state duration in seconds. Default 0 (no persistence).
+     */
+    runnerPersistenceMax?: number;
+    /**
+     * Maximum size ratio (larger.x / smaller.x) allowed for a merge. Default Infinity (no limit).
+     */
+    mergeSizeRatioLimit?: number;
+    /**
+     * How many frames the surviving drop is immune to merges after absorbing another drop. Default 0.
+     */
+    mergeCooldownFrames?: number;
+    /**
+     * Evaporate rate (mass/s) applied specifically to trail drops (parent !== undefined).
+     * Defaults to `evaporate` when absent.
+     */
+    trailEvaporate?: number;
+    /**
+     * Spread shrink rate applied specifically to trail drops (parent !== undefined).
+     * Defaults to `shrinkRate` when absent.
+     */
+    trailShrinkRate?: number;
+    /**
+     * Piecewise gravity multiplier bands by drop size (size.x in simulator pixels).
+     * Evaluated in order; first band whose maxSize >= size.x wins.
+     * Default [] — flat gravity for all sizes.
+     */
+    velocityGravityBands?: Array<{ maxSize: number; multiplier: number }>;
+
+    /**
+     * Post-merge velocity amplification multiplier (optional).
+     * When a drop absorbs another, this multiplier boosts the surviving drop's velocity.
+     * Defaults to 1.0 (no boost; preserve momentum conservation).
+     */
+    postMergeGrowthMultiplier?: number;
+
+    /**
+     * Runner termination mass threshold (optional, in mass units).
+     * If a runner drop's mass falls below this threshold, it exits runner state early.
+     * Defaults to 0 (disabled; only persistence timer controls exit).
+     */
+    runnerTerminationMassThreshold?: number;
 }
 
 export class CollisionGrid extends Array<RainDrop>
@@ -196,6 +259,8 @@ export class RaindropSimulator
                 continue;
             
             raindrop.updateRaindrop(time);
+            if (raindrop.mergeCooldownFrames > 0)
+                raindrop.mergeCooldownFrames--;
             if (raindrop.pos.y < -100)
                 raindrop.destroied = true;
             
@@ -247,15 +312,32 @@ export class RaindropSimulator
                         let distance = Math.sqrt(dx * dx + dy * dy);
                         if (distance - raindrop.mergeDistance - other.mergeDistance < 0)
                         {
+                            // Size ratio guard: skip merges where drops are too different in size
+                            const sizeRatioLimit = this.options.mergeSizeRatioLimit ?? Infinity;
+                            if (isFinite(sizeRatioLimit)) {
+                                const larger = Math.max(raindrop.size.x, other.size.x);
+                                const smaller = Math.min(raindrop.size.x, other.size.x);
+                                if (smaller > 0 && larger / smaller > sizeRatioLimit)
+                                    continue;
+                            }
+                            // Merge cooldown guard: skip if either drop is in post-merge cooldown
+                            if (raindrop.mergeCooldownFrames > 0 || other.mergeCooldownFrames > 0)
+                                continue;
+
+                            const cooldownFrames = this.options.mergeCooldownFrames ?? 0;
                             if (raindrop.mass >= other.mass)
                             {
                                 raindrop.merge(other);
                                 other.destroied = true;
+                                if (cooldownFrames > 0)
+                                    raindrop.mergeCooldownFrames = cooldownFrames;
                             }
                             else
                             {
                                 other.merge(raindrop);
                                 raindrop.destroied = true;
+                                if (cooldownFrames > 0)
+                                    other.mergeCooldownFrames = cooldownFrames;
                             }
                         }
                     }

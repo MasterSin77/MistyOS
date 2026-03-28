@@ -875,6 +875,9 @@ function App() {
                   <p className="line">Renderer source: {rendererStats.rendererInputSource || 'n/a'}</p>
                   <p className="line">Spawn interval: {JSON.stringify(rendererStats.simulatorSpawnInterval ?? 'n/a')}</p>
                   <p className="line">Spawn limit: {rendererStats.simulatorSpawnLimit ?? 'n/a'}</p>
+                  <p className="line">Baseline groups applied: {rendererStats.baselineSeedGroupsApplied ? JSON.stringify(rendererStats.baselineSeedGroupsApplied) : 'n/a'}</p>
+                  <p className="line">Baseline sim options: {rendererStats.baselineSeedSimulatorOptionSnapshot ? JSON.stringify(rendererStats.baselineSeedSimulatorOptionSnapshot) : 'n/a'}</p>
+                  <p className="line">Baseline unsupported: {rendererStats.baselineSeedUnsupportedControls ? JSON.stringify(rendererStats.baselineSeedUnsupportedControls) : 'n/a'}</p>
                   <p className="line">Procedural droplets/s: {rendererStats.proceduralDropletsPerSecond ?? 'n/a'}</p>
                   <p className="line">Procedural mist: {rendererStats.proceduralMistEnabled === null || rendererStats.proceduralMistEnabled === undefined ? 'n/a' : rendererStats.proceduralMistEnabled ? 'on' : 'off'}</p>
                   <p className="line">Frame dt: {(rendererStats.frameDt || 0).toFixed(3)}s</p>

@@ -59,6 +59,17 @@ const loadRaindropFxScript = () => {
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value))
 
+const toNumber = (value, fallback = 0) => {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+const rangeTuple = (minValue, maxValue, lowerBound, upperBound) => {
+  const min = clamp(toNumber(minValue, lowerBound), lowerBound, upperBound)
+  const max = clamp(toNumber(maxValue, min), min, upperBound)
+  return [min, max]
+}
+
 const collectEntityList = (value) => {
   if (!value) {
     return []
@@ -85,6 +96,20 @@ const collectEntityList = (value) => {
   return []
 }
 
+// Lazy-load diagnostics to avoid circular dependencies
+let BaselineSeedBehaviorDiagnostics = null
+async function getBaselineSeedBehaviorDiagnosticsClass() {
+  if (BaselineSeedBehaviorDiagnostics) return BaselineSeedBehaviorDiagnostics
+  try {
+    const mod = await import('./baselineSeedBehaviorDiagnostics.js')
+    BaselineSeedBehaviorDiagnostics = mod.BaselineSeedBehaviorDiagnostics
+    return BaselineSeedBehaviorDiagnostics
+  } catch (e) {
+    console.warn('[RaindropFxRendererAdapter] Could not load diagnostics module:', e.message)
+    return null
+  }
+}
+
 export class RaindropFxRendererAdapter {
   constructor({ width, height, background, tuningConfig }) {
     this.width = width
@@ -100,6 +125,25 @@ export class RaindropFxRendererAdapter {
     this.nextEntityId = 1
     const query = new URLSearchParams(window.location.search)
     this.nativeEntitiesOnlyDebug = query.get('rdfxNativeOnly') === '1'
+    this.baselineSeedDebugEnabled = query.get('rdfxBaselineSeedDebug') === '1'
+    this.sizePipelineProofEnabled = query.get('rdfxSizeProof') === '1' || this.baselineSeedDebugEnabled
+    this.diagnostics = null
+    this.sizePipelineProof = {
+      enabled: this.sizePipelineProofEnabled,
+      hooksInstalled: false,
+      spawnSamples: [],
+      renderSamples: [],
+      droppedSpawnSamples: 0,
+      droppedRenderSamples: 0,
+      spawnSampleLimit: 160,
+      renderSampleLimit: 160,
+      maxSamplesPerFrame: 6,
+      firstSeenByRef: new WeakMap(),
+      patchState: {
+        spawnPatched: false,
+        drawPatched: false,
+      },
+    }
     this.debug = {
       scriptLoaded: false,
       initStarted: false,
@@ -118,6 +162,11 @@ export class RaindropFxRendererAdapter {
       proceduralMistEnabled: null,
       frameDt: 0,
       lastFrameTotal: 0,
+      baselineSeedGroupsApplied: null,
+      baselineSeedSimulatorOptionSnapshot: null,
+      baselineSeedUnsupportedControls: null,
+      baselineSeedDiagnosticsEnabled: this.baselineSeedDebugEnabled,
+      sizePipelineProofEnabled: this.sizePipelineProofEnabled,
       lastError: null,
     }
     this.canvas = document.createElement('canvas')
@@ -186,6 +235,7 @@ export class RaindropFxRendererAdapter {
       this.debug.initCompleted = true
       this.debug.lastError = null
       this.applyRuntimeSettings()
+      this.installSizePipelineProofHooks()
     } catch (error) {
       this.ready = false
       this.debug.initCompleted = false
@@ -275,10 +325,370 @@ export class RaindropFxRendererAdapter {
         dropletsPerSeconds: options.dropletsPerSeconds,
         dropletSize: [...options.dropletSize],
       }
+
+      this.applyBaselineSeedBehaviorToSimulatorOptions(this.instance.simulator.options)
+
+      // Record startup snapshot for baseline-seed debug mode if enabled
+      if (this.baselineSeedDebugEnabled) {
+        this._recordBaselineSeedDiagnosticsStartupSnapshot(this.instance.simulator.options)
+      }
     }
 
     this.debug.proceduralDropletsPerSecond = options.dropletsPerSeconds ?? null
     this.debug.proceduralMistEnabled = options.mist ?? null
+  }
+
+  applyBaselineSeedBehaviorToSimulatorOptions(simOptions) {
+    const baselineBehavior = this.tuningConfig?.raindropFxBaselineBehavior?.behaviorParameters
+    if (!baselineBehavior || !simOptions || typeof simOptions !== 'object') {
+      return
+    }
+
+    const spawnRate = clamp(toNumber(baselineBehavior.spawnModel?.spatial?.globalRatePerSecond, 62), 1, 1200)
+    const burstAmplitude = clamp(toNumber(baselineBehavior.spawnModel?.temporal?.burstiness?.amplitude, 0.23), 0, 1)
+    const minInterArrivalMs = clamp(toNumber(baselineBehavior.spawnModel?.temporal?.interArrivalClampMs?.min, 6), 1, 1000)
+    const maxInterArrivalMs = clamp(toNumber(baselineBehavior.spawnModel?.temporal?.interArrivalClampMs?.max, 140), minInterArrivalMs, 2000)
+    const baseInterArrivalSec = 1 / spawnRate
+    const burstScale = 1 + burstAmplitude * 0.5
+    const spawnIntervalMinSec = Math.max(minInterArrivalMs / 1000, baseInterArrivalSec / burstScale)
+    const spawnIntervalMaxSec = Math.min(maxInterArrivalMs / 1000, baseInterArrivalSec * burstScale)
+    const spawnIntervalTuple = rangeTuple(spawnIntervalMinSec, spawnIntervalMaxSec, 0.001, 5)
+
+    const sizeMin = clamp(toNumber(baselineBehavior.sizeModel?.diameterPxAt1080p?.hardClamp?.min, 1.4), 0.1, 100)
+    const sizeMax = clamp(toNumber(baselineBehavior.sizeModel?.diameterPxAt1080p?.hardClamp?.max, 9.5), sizeMin, 200)
+    // Frozen RaindropFX simulator expects larger spawn-size units (~60..100 defaults).
+    // Preserve seed-driven relative behavior by projecting diameter px into simulator units.
+    //
+    // Size upper bound: use the mixture-weighted mean diameter to derive a distribution-matching
+    // max for uniform sampling, instead of the raw hard-clamp max.
+    // For a uniform [min, max] to have the same mean as the lognormal mixture:
+    //   distribMax = 2 * mixMean - sizeMin
+    // This shifts the spawn distribution toward fine/medium drops (seed: 58%+32%=90%)
+    // and stops over-representing the large-drop tail (seed: 10% but uniform gives ~37%).
+    // Large drops still emerge through merging; runner thresholds self-adjust below.
+      // Spawn size upper bound: derive from the mixture-weighted arithmetic mean of the
+      // lognormal components.  For a lognormal component with parameters (mu, sigma), the
+      // arithmetic mean is exp(mu + sigma²/2) — using sigma here (not just mu) prevents
+      // the distribMaxPx from collapsing to the sizeMax fallback when components are present.
+      //
+      // For a uniform[sizeMin, distribMax] to match that weighted mean:
+      //   distribMax = 2 * mixMean - sizeMin
+      // This concentrates spawns in the fine+medium feeder band (seed: 58%+32%=90%)
+      // and reserves large drops for accumulation rather than direct spawning.
+      const mixComponentsArr = baselineBehavior.sizeModel?.diameterPxAt1080p?.components
+      let mixMeanPx
+      if (Array.isArray(mixComponentsArr) && mixComponentsArr.length > 0) {
+        let totalWeight = 0
+        let weightedMean = 0
+        for (const c of mixComponentsArr) {
+          const w = toNumber(c.weight, 0)
+          const mu = toNumber(c.mu, 0)
+          const sig = toNumber(c.sigma, 0.2)
+          // Arithmetic mean of lognormal(mu, sigma) = exp(mu + sigma²/2)
+          weightedMean += w * Math.exp(mu + (sig * sig) / 2)
+          totalWeight += w
+        }
+        mixMeanPx = totalWeight > 0.001 ? weightedMean / totalWeight : (sizeMin + sizeMax) / 2
+      } else {
+        mixMeanPx = (sizeMin + sizeMax) / 2
+      }
+      // distribMax bounded by sizeMax so we never exceed the seed hard clamp.
+      const distribMaxPx = clamp(2 * mixMeanPx - sizeMin, sizeMin + 0.5, sizeMax)
+      const simulatorSpawnSize = rangeTuple(sizeMin * 10, distribMaxPx * 10, 4, 240)
+
+    const mergeNeighborhood = clamp(toNumber(baselineBehavior.mergeModel?.neighborhoodRadiusPxAt1080p, 2.4), 0.2, 20)
+    const mergeRatioLimit = clamp(toNumber(baselineBehavior.mergeModel?.sizeRatioLimitForMerge, 4.5), 0.5, 20)
+    const mergeEnergyLossFactor = clamp(toNumber(baselineBehavior.mergeModel?.postMerge?.energyLossFactor, 0.08), 0, 1)
+
+    const velocityBase = clamp(toNumber(baselineBehavior.velocityModel?.verticalSpeedPxPerSecondAt1080p?.base, 38), 1, 1200)
+    const velocityMax = clamp(toNumber(baselineBehavior.velocityModel?.verticalSpeedPxPerSecondAt1080p?.maxClamp, 168), velocityBase + 1, 2400)
+    const lateralDriftStrength = clamp(toNumber(baselineBehavior.velocityModel?.lateral?.driftStrength, 0.11), 0, 2)
+    const velocitySizeExponent = clamp(toNumber(baselineBehavior.velocityModel?.verticalSpeedPxPerSecondAt1080p?.sizeExponent, 1.27), 0.1, 4)
+
+    const trailDeposit = clamp(toNumber(baselineBehavior.trailModel?.deposition?.depositFactor, 0.34), 0, 2)
+    const fastHalfLife = clamp(toNumber(baselineBehavior.trailModel?.decay?.fastHalfLifeSeconds, 0.95), 0.05, 30)
+    const slowHalfLife = clamp(toNumber(baselineBehavior.trailModel?.decay?.slowHalfLifeSeconds, 4.6), fastHalfLife, 60)
+    const trailPickup = clamp(toNumber(baselineBehavior.trailModel?.reactivation?.freshDropTrailPickup, 0.12), 0, 1)
+
+    const runnerMassThreshold0to1 = clamp(toNumber(baselineBehavior.runnerModel?.emergence?.massThreshold, 0.67), 0, 1)
+    const runnerProbability = clamp(toNumber(baselineBehavior.runnerModel?.emergence?.probabilityWhenEligible, 0.36), 0, 1)
+    const runnerSpeedMultiplier = clamp(toNumber(baselineBehavior.runnerModel?.runnerDynamics?.speedMultiplier, 1.58), 0.1, 10)
+    const runnerTrailPx = clamp(toNumber(baselineBehavior.runnerModel?.emergence?.minContinuousTrailPxAt1080p, 18), 2, 120)
+    const runnerPersistenceMin = clamp(toNumber(baselineBehavior.runnerModel?.runnerDynamics?.persistenceSeconds?.min, 0.8), 0, 60)
+    const runnerPersistenceMax = clamp(toNumber(baselineBehavior.runnerModel?.runnerDynamics?.persistenceSeconds?.max, 3.1), 0, 60)
+    const mergeCooldown = Math.round(clamp(toNumber(baselineBehavior.mergeModel?.cooldownFrames, 3), 0, 120))
+    const piecewiseBands = baselineBehavior.velocityModel?.verticalSpeedPxPerSecondAt1080p?.piecewiseBands
+
+    // Loud validation for required seed fields that now have direct runtime mappings
+    if (baselineBehavior.runnerModel?.runnerDynamics?.persistenceSeconds == null) {
+      console.error('[RaindropFxRendererAdapter] Baseline seed missing runnerModel.runnerDynamics.persistenceSeconds — using defaults [0.8, 3.1]')
+    }
+    if (baselineBehavior.mergeModel?.cooldownFrames == null) {
+      console.error('[RaindropFxRendererAdapter] Baseline seed missing mergeModel.cooldownFrames — using default 3')
+    }
+    if (!Array.isArray(piecewiseBands) || piecewiseBands.length === 0) {
+      console.error('[RaindropFxRendererAdapter] Baseline seed missing/empty velocityModel.verticalSpeedPxPerSecondAt1080p.piecewiseBands — piecewise gravity disabled')
+    }
+    if (!baselineBehavior.mergeModel?.growthAssist) {
+      console.warn('[RaindropFxRendererAdapter] Baseline seed missing mergeModel.growthAssist — post-merge growth assist disabled')
+    }
+    if (!baselineBehavior.runnerModel?.runnerDynamics?.termination) {
+      console.warn('[RaindropFxRendererAdapter] Baseline seed missing runnerModel.runnerDynamics.termination — runner mass-based termination disabled')
+    }
+
+    simOptions.spawnInterval = spawnIntervalTuple
+    simOptions.spawnSize = simulatorSpawnSize
+    // Multiplier 6.0 ≈ expected drop lifetime budget at steady state (2–10 s per drop at 62/s).
+    // The prior 2.4× was too low; drops with merging and trail persistence accumulate beyond
+    // that headroom, so new spawns were being gated before steady-state density was reached.
+    simOptions.spawnLimit = Math.round(clamp(spawnRate * 6.0, 12, 512))
+
+    // Merge behavior in frozen runtime is controlled by colliderSize.
+    simOptions.colliderSize = clamp((mergeNeighborhood / 2.4) * (mergeRatioLimit / 4.5), 0.45, 2.2)
+
+    // Velocity behavior maps to gravity + lateral shifting in frozen runtime.
+    simOptions.gravity = clamp((velocityMax / 168) * 2400, 400, 6000)
+    simOptions.xShifting = rangeTuple(0, lateralDriftStrength * velocitySizeExponent, 0, 1.2)
+    simOptions.motionInterval = rangeTuple(0.08, 0.5 / Math.max(0.05, toNumber(baselineBehavior.velocityModel?.lateral?.noiseFrequencyHz, 0.35)), 0.03, 1.2)
+
+    // Trail behavior maps to trail split density/size/distance in frozen runtime.
+    simOptions.trailDropDensity = clamp(trailDeposit * 0.6 + mergeEnergyLossFactor * 0.5, 0.05, 0.7)
+    simOptions.trailDropSize = rangeTuple(Math.max(0.12, trailPickup * 1.8), Math.max(0.2, trailPickup * 3.4), 0.12, 1.2)
+    const distanceScale = clamp((fastHalfLife + slowHalfLife) / 5.55, 0.25, 4)
+    simOptions.trailDistance = rangeTuple((runnerTrailPx * 0.9) / distanceScale, (runnerTrailPx * 1.4) / distanceScale, 8, 90)
+    simOptions.trailSpread = clamp(0.35 + trailDeposit * 0.8, 0.2, 2.5)
+    simOptions.velocitySpread = clamp(0.22 + (velocityBase / velocityMax) * 0.55, 0.1, 1.4)
+    // Active frozen runtime consumes global shrinkRate/evaporate directly.
+    // Keep rates in the runtime's native range so long runners do not linger syrupy.
+    simOptions.shrinkRate = clamp(0.05 / Math.max(0.08, slowHalfLife), 0.005, 0.08)
+    simOptions.evaporate = clamp(96 / Math.max(0.08, slowHalfLife), 10, 120)
+
+    // Base slip rate for all drops. Runner speed is now directly controlled via runnerSpeedMultiplier.
+    simOptions.slipRate = clamp(0.08, 0, 0.95)
+
+    // Direct 1:1 runner option mappings — runtime now exposes these gates natively.
+    const minMass = simulatorSpawnSize[0] ** 2
+    const maxMass = simulatorSpawnSize[1] ** 2
+    simOptions.runnerSplitMassThreshold = clamp(minMass + runnerMassThreshold0to1 * (maxMass - minMass), 1, 1e6)
+    simOptions.runnerSplitProbability = runnerProbability
+    simOptions.runnerSpeedMultiplier = runnerSpeedMultiplier
+    simOptions.runnerPersistenceMin = runnerPersistenceMin
+    simOptions.runnerPersistenceMax = Math.max(runnerPersistenceMin, runnerPersistenceMax)
+
+    // Direct 1:1 merge option mappings.
+    simOptions.mergeSizeRatioLimit = mergeRatioLimit
+    simOptions.mergeCooldownFrames = mergeCooldown
+
+    // Trail-drop-specific decay (fast half-life path) for trail drops.
+    simOptions.trailEvaporate = clamp(96 / Math.max(0.08, fastHalfLife), 10, 120)
+    simOptions.trailShrinkRate = clamp(0.05 / Math.max(0.08, fastHalfLife), 0.005, 0.08)
+
+    // Piecewise gravity bands: convert seed px-diameter bands to simulator size units (×10).
+    if (Array.isArray(piecewiseBands) && piecewiseBands.length > 0) {
+      simOptions.velocityGravityBands = piecewiseBands.map(band => ({
+        maxSize: clamp((band.maxDiameter ?? 10) * 10, 1, 2400),
+        multiplier: clamp(band.multiplier ?? 1, 0.01, 10),
+      }))
+    }
+
+    // Post-merge growth assist: optional velocity boost after merge
+    const growthAssistCollisionGain = clamp(toNumber(baselineBehavior.mergeModel?.growthAssist?.collisionGain, 0), 0, 2)
+    if (growthAssistCollisionGain > 0) {
+      simOptions.postMergeGrowthMultiplier = clamp(1 + growthAssistCollisionGain * 0.15, 1, 3)
+    }
+
+    // Runner termination: early exit from runner state when mass drops below threshold
+    const terminationDrynessCutoff = clamp(toNumber(baselineBehavior.runnerModel?.runnerDynamics?.termination?.drynessCutoff, 0), 0, 1)
+    if (terminationDrynessCutoff > 0) {
+      // Map dryness cutoff to mass threshold: high dryness = low mass threshold
+        // Termination threshold must stay BELOW runnerSplitMassThreshold so that runners
+        // formed via accumulation (merging near the split floor) actually persist.
+        // Previously anchored to spawn maxMass, placing the threshold above the creation floor
+        // and immediately killing every newly formed runner — accumulation pathway was broken.
+        // Fix: scale as (1 - drynessCutoff) of the creation threshold so runners survive until
+        // they lose ~drynessCutoff fraction of their mass post-formation.
+        simOptions.runnerTerminationMassThreshold = clamp(
+          simOptions.runnerSplitMassThreshold * (1 - terminationDrynessCutoff),
+          1,
+          simOptions.runnerSplitMassThreshold * 0.99
+        )
+    }
+
+    simOptions.__baselineSeedBehavior = baselineBehavior
+    this.debug.baselineSeedGroupsApplied = {
+      spawnModel: true,
+      sizeModel: true,
+      mergeModel: true,
+      velocityModel: true,
+      trailModel: true,
+      runnerModel: true,
+    }
+    this.debug.baselineSeedSimulatorOptionSnapshot = {
+      spawnInterval: simOptions.spawnInterval,
+      spawnSize: simOptions.spawnSize,
+      spawnLimit: simOptions.spawnLimit,
+      colliderSize: simOptions.colliderSize,
+      gravity: simOptions.gravity,
+      xShifting: simOptions.xShifting,
+      motionInterval: simOptions.motionInterval,
+      trailDropDensity: simOptions.trailDropDensity,
+      trailDropSize: simOptions.trailDropSize,
+      trailDistance: simOptions.trailDistance,
+      trailSpread: simOptions.trailSpread,
+      velocitySpread: simOptions.velocitySpread,
+      shrinkRate: simOptions.shrinkRate,
+      evaporate: simOptions.evaporate,
+      slipRate: simOptions.slipRate,
+      runnerSplitMassThreshold: simOptions.runnerSplitMassThreshold,
+      runnerSplitProbability: simOptions.runnerSplitProbability,
+      runnerSpeedMultiplier: simOptions.runnerSpeedMultiplier,
+      runnerPersistenceMin: simOptions.runnerPersistenceMin,
+      runnerPersistenceMax: simOptions.runnerPersistenceMax,
+      mergeSizeRatioLimit: simOptions.mergeSizeRatioLimit,
+      mergeCooldownFrames: simOptions.mergeCooldownFrames,
+      trailEvaporate: simOptions.trailEvaporate,
+      trailShrinkRate: simOptions.trailShrinkRate,
+      velocityGravityBands: simOptions.velocityGravityBands,
+      postMergeGrowthMultiplier: simOptions.postMergeGrowthMultiplier,
+      runnerTerminationMassThreshold: simOptions.runnerTerminationMassThreshold,
+    }
+    this.debug.baselineSeedUnsupportedControls = {
+      trailModel: ['decay.bi-exponential shape details'],
+      mergeModel: [],
+      runnerModel: [],
+    }
+  }
+
+  installSizePipelineProofHooks() {
+    if (!this.sizePipelineProofEnabled || !this.instance || this.sizePipelineProof.hooksInstalled) {
+      return
+    }
+
+    const simulator = this.instance.simulator
+    const renderer = this.instance.renderer
+    if (!simulator || !renderer) {
+      return
+    }
+
+    // Hook spawn path to sample initial simulator size and mass from freshly emitted drops.
+    const spawner = simulator.spawner
+    const originalTrySpawn = spawner?.trySpawn
+    if (spawner && typeof originalTrySpawn === 'function') {
+      const adapter = this
+      spawner.trySpawn = function* patchedTrySpawn(...args) {
+        const generator = originalTrySpawn.apply(this, args)
+        for (const drop of generator) {
+          adapter.recordSpawnProofSample(drop)
+          yield drop
+        }
+      }
+      this.sizePipelineProof.patchState.spawnPatched = true
+    }
+
+    // Hook renderer draw path to sample final draw scale values sent to the GPU.
+    const originalDrawRaindrops = renderer.drawRaindrops
+    if (typeof originalDrawRaindrops === 'function') {
+      const adapter = this
+      renderer.drawRaindrops = function patchedDrawRaindrops(...args) {
+        const result = originalDrawRaindrops.apply(this, args)
+        adapter.recordRenderProofSample(this, args[0])
+        return result
+      }
+      this.sizePipelineProof.patchState.drawPatched = true
+    }
+
+    this.sizePipelineProof.hooksInstalled = true
+  }
+
+  recordSpawnProofSample(drop) {
+    if (!this.sizePipelineProofEnabled || !drop || drop.destroied) {
+      return
+    }
+
+    const samples = this.sizePipelineProof.spawnSamples
+    if (samples.length >= this.sizePipelineProof.spawnSampleLimit) {
+      this.sizePipelineProof.droppedSpawnSamples += 1
+      return
+    }
+
+    const sizeX = toNumber(drop.size?.x, 0)
+    const sizeY = toNumber(drop.size?.y, sizeX)
+    const mass = toNumber(drop.mass ?? drop._mass, 0)
+    const density = toNumber(drop.density, 1)
+    samples.push({
+      ts: performance.now(),
+      sizeX,
+      sizeY,
+      mass,
+      density,
+      inferredRadiusPx: sizeX * 0.5,
+      inferredDiameterPx: sizeX,
+      spawnSizeRange: Array.isArray(this.instance?.simulator?.options?.spawnSize)
+        ? [...this.instance.simulator.options.spawnSize]
+        : null,
+    })
+  }
+
+  recordRenderProofSample(renderer, raindrops) {
+    if (!this.sizePipelineProofEnabled || !renderer || !Array.isArray(raindrops)) {
+      return
+    }
+
+    const samples = this.sizePipelineProof.renderSamples
+    const maxToSample = Math.min(this.sizePipelineProof.maxSamplesPerFrame, raindrops.length)
+    for (let i = 0; i < maxToSample; i += 1) {
+      const drop = raindrops[i]
+      if (!drop || drop.destroied) {
+        continue
+      }
+
+      const seen = this.sizePipelineProof.firstSeenByRef.get(drop)
+      if (seen) {
+        continue
+      }
+
+      if (samples.length >= this.sizePipelineProof.renderSampleLimit) {
+        this.sizePipelineProof.droppedRenderSamples += 1
+        return
+      }
+
+      this.sizePipelineProof.firstSeenByRef.set(drop, true)
+
+      const sizeX = toNumber(drop.size?.x, 0)
+      const sizeY = toNumber(drop.size?.y, sizeX)
+      const mass = toNumber(drop.mass ?? drop._mass, 0)
+      const sizeAttr = toNumber(renderer.raindropBuffer?.[i]?.size?.[0], 0)
+      const modelMatrix = renderer.raindropBuffer?.[i]?.modelMatrix
+      const m00 = modelMatrix ? toNumber(modelMatrix[0], 0) : 0
+      const m11 = modelMatrix ? toNumber(modelMatrix[5], 0) : 0
+
+      samples.push({
+        ts: performance.now(),
+        sizeX,
+        sizeY,
+        mass,
+        drawScaleInputX: sizeX,
+        drawScaleInputY: sizeY,
+        shaderSizeAttr: sizeAttr,
+        shaderSizeAttrTimes100: sizeAttr * 100,
+        modelMatrixScaleX: m00,
+        modelMatrixScaleY: m11,
+      })
+    }
+  }
+
+  getSizePipelineProofReport() {
+    const simulatorOptions = this.instance?.simulator?.options
+    return {
+      enabled: this.sizePipelineProof.enabled,
+      hooksInstalled: this.sizePipelineProof.hooksInstalled,
+      patchState: { ...this.sizePipelineProof.patchState },
+      droppedSpawnSamples: this.sizePipelineProof.droppedSpawnSamples,
+      droppedRenderSamples: this.sizePipelineProof.droppedRenderSamples,
+      activeSpawnSizeRange: Array.isArray(simulatorOptions?.spawnSize) ? [...simulatorOptions.spawnSize] : null,
+      spawnSamples: this.sizePipelineProof.spawnSamples.map((sample) => ({ ...sample })),
+      renderSamples: this.sizePipelineProof.renderSamples.map((sample) => ({ ...sample })),
+    }
   }
 
   getStableEntityId(drop, fallbackIndex) {
@@ -392,6 +802,7 @@ export class RaindropFxRendererAdapter {
       ...this.debug,
       inputScale: { ...this.inputScale },
       flipYAxis: this.flipYAxis,
+      sizePipelineProof: this.getSizePipelineProofReport(),
     }
   }
 
@@ -403,5 +814,42 @@ export class RaindropFxRendererAdapter {
     this.lastSimulatorSnapshot = []
     this.entityIdByRef = new WeakMap()
     this.ready = false
+  }
+
+  async _recordBaselineSeedDiagnosticsStartupSnapshot(simOptions) {
+    if (!this.baselineSeedDebugEnabled) return
+    
+    try {
+      if (!BaselineSeedBehaviorDiagnostics) {
+        await getBaselineSeedBehaviorDiagnosticsClass()
+      }
+      
+      if (!BaselineSeedBehaviorDiagnostics) {
+        console.warn('[RaindropFxRendererAdapter] Diagnostics class not available')
+        return
+      }
+
+      if (!this.diagnostics) {
+        this.diagnostics = new BaselineSeedBehaviorDiagnostics(true)
+      }
+
+      this.diagnostics.recordStartupSnapshot(simOptions)
+    } catch (e) {
+      console.warn('[RaindropFxRendererAdapter] Error recording startup snapshot:', e.message)
+    }
+  }
+
+  recordBaselineSeedFrameSample(frameIndex, elapsedSeconds) {
+    if (!this.baselineSeedDebugEnabled || !this.diagnostics) return
+    
+    const simulator = this.instance?.simulator
+    if (simulator) {
+      this.diagnostics.recordFrameSample(frameIndex, elapsedSeconds, simulator)
+    }
+  }
+
+  getBaselineSeedDiagnosticsReport() {
+    if (!this.diagnostics) return null
+    return this.diagnostics.getReport()
   }
 }
