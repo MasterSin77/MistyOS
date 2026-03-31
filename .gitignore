@@ -8,3 +8,7 @@ coverage/
 archive/
 tools/logs/
 *.tsbuildinfo
+
+# Disposable experiment outputs (workflow-hardening)
+artifacts/experiments/**
+!artifacts/experiments/.gitkeep

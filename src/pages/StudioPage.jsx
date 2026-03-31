@@ -501,6 +501,11 @@ function StudioPage() {
   const previewEngineRef = useRef(null)
   const previewHostIdentityRef = useRef(0)
   const previewLastHostRef = useRef(null)
+  const previewRuntimePayloadStabilityRef = useRef({
+    fingerprint: null,
+    payload: null,
+    source: 'working',
+  })
   const previewMountCountRef = useRef(0)
   const previewUnmountCountRef = useRef(0)
   const menuRegionRef = useRef(null)
@@ -942,14 +947,27 @@ function StudioPage() {
     () => compileClipsToTimeline(normalizedEditorClips, timelineDurationSec, selectedTimeline?.id),
     [normalizedEditorClips, timelineDurationSec, selectedTimeline?.id],
   )
+  const selectedTimelineBaselineClips = useMemo(() => {
+    try {
+      return parseTimelineToClips(selectedTimeline)
+        .map((clip) => normalizeClip(clip, timelineDurationSec))
+        .filter(Boolean)
+    } catch {
+      return []
+    }
+  }, [selectedTimeline, timelineDurationSec])
+  const hasAuthoredTimelineOverride = useMemo(
+    () => runtimePayloadFingerprint(normalizedEditorClips) !== runtimePayloadFingerprint(selectedTimelineBaselineClips),
+    [normalizedEditorClips, selectedTimelineBaselineClips],
+  )
   const workingRuntimePayload = useMemo(() => buildWorkingRuntimePayload({
     selectedSceneId: activeSceneId,
     selectedPresetId: activePresetId,
     selectedTimelineId: activeTimelineId,
     startupMode: settings.startupMode,
     timelineDurationSec,
-    normalizedClips: normalizedEditorClips,
-    authoredTimeline,
+    normalizedClips: hasAuthoredTimelineOverride ? normalizedEditorClips : null,
+    authoredTimeline: hasAuthoredTimelineOverride ? authoredTimeline : null,
     loopPlayback,
     settingsSnapshot: {
       startupMode: settings.startupMode,
@@ -964,6 +982,7 @@ function StudioPage() {
     activeSceneId,
     activeTimelineId,
     authoredTimeline,
+    hasAuthoredTimelineOverride,
     loopPlayback,
     normalizedEditorClips,
     settings.presentation?.autoRunTimeline,
@@ -984,15 +1003,42 @@ function StudioPage() {
     () => runtimePayloadFingerprint(publishedDocument?.runtimePayload || null),
     [publishedDocument?.runtimePayload],
   )
-  const previewRuntimePayload = useMemo(
+  const previewRuntimePayloadCandidate = useMemo(
     () => publishedDocument?.runtimePayload || savedDocument?.runtimePayload || workingRuntimePayload || null,
     [publishedDocument?.runtimePayload, savedDocument?.runtimePayload, workingRuntimePayload],
   )
-  const previewRuntimeSource = publishedDocument?.runtimePayload
+  const previewRuntimeSourceCandidate = publishedDocument?.runtimePayload
     ? 'published'
     : savedDocument?.runtimePayload
       ? 'saved'
       : 'working'
+  const previewRuntimePayloadCandidateFingerprint = useMemo(
+    () => runtimePayloadFingerprint(previewRuntimePayloadCandidate),
+    [previewRuntimePayloadCandidate],
+  )
+  const previewRuntimeSelection = useMemo(() => {
+    const stableSelection = previewRuntimePayloadStabilityRef.current
+    if (stableSelection.fingerprint === previewRuntimePayloadCandidateFingerprint) {
+      return {
+        payload: stableSelection.payload,
+        source: stableSelection.source,
+      }
+    }
+
+    const nextSelection = {
+      fingerprint: previewRuntimePayloadCandidateFingerprint,
+      payload: previewRuntimePayloadCandidate,
+      source: previewRuntimeSourceCandidate,
+    }
+    previewRuntimePayloadStabilityRef.current = nextSelection
+
+    return {
+      payload: nextSelection.payload,
+      source: nextSelection.source,
+    }
+  }, [previewRuntimePayloadCandidate, previewRuntimePayloadCandidateFingerprint, previewRuntimeSourceCandidate])
+  const previewRuntimePayload = previewRuntimeSelection.payload
+  const previewRuntimeSource = previewRuntimeSelection.source
   const previewRuntimeExecution = useMemo(
     () => resolveRuntimeExecutionFromPayload(previewRuntimePayload),
     [previewRuntimePayload],
@@ -2178,10 +2224,47 @@ function StudioPage() {
     setActivePresetId(nextPresetId)
     setActiveTimelineId(nextTimelineId)
 
+    const hasAuthoredTimelinePayload = Boolean(payload.authoredTimeline && typeof payload.authoredTimeline === 'object')
+    const resolveSelectedTimelineClips = () => {
+      const nextTimeline = timelineCatalog.find((timeline) => timeline.id === nextTimelineId)
+      try {
+        setEditorClips(parseTimelineToClips(nextTimeline))
+      } catch (error) {
+        console.warn('[MistyOS][Studio] Timeline clip rehydrate failed; using empty clip set.', {
+          requestedTimelineId,
+          nextTimelineId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        setEditorClips([])
+      }
+    }
+
     if (Array.isArray(payload.normalizedClips)) {
       setEditorClips(payload.normalizedClips)
+    } else if ((payload.normalizedClips === null || payload.normalizedClips === undefined) && !hasAuthoredTimelinePayload) {
+      // Preloaded timeline saves intentionally omit authored clips; hydrate from the selected catalog timeline.
+      resolveSelectedTimelineClips()
     } else if (payload.normalizedClips !== undefined) {
-      warnings.push('Invalid clip data detected; retained existing timeline clips.')
+      const normalizedClipDataType = payload.normalizedClips === null
+        ? 'null'
+        : Array.isArray(payload.normalizedClips)
+          ? 'array'
+          : typeof payload.normalizedClips
+      console.warn('[MistyOS][Studio] Invalid clip payload detected during runtime payload apply.', {
+        requestedTimelineId,
+        nextTimelineId,
+        normalizedClipDataType,
+        hasAuthoredTimelinePayload,
+      })
+      warnings.push('Invalid clip data detected; reloaded selected timeline clips.')
+      resolveSelectedTimelineClips()
+    } else if (hasAuthoredTimelinePayload) {
+      console.warn('[MistyOS][Studio] Authored timeline payload missing normalized clips; reloading selected timeline clips.', {
+        requestedTimelineId,
+        nextTimelineId,
+      })
+      warnings.push('Authored clip payload was incomplete; reloaded selected timeline clips.')
+      resolveSelectedTimelineClips()
     }
     if (typeof payload.loopPlayback === 'boolean') {
       setLoopPlayback(payload.loopPlayback)
@@ -2234,6 +2317,15 @@ function StudioPage() {
 
     switchActiveProject(projectId)
   }, [activeProjectId, hasUnsavedChanges])
+
+  const handleActiveTimelineChange = useCallback((timelineId) => {
+    if (!timelineId) {
+      return
+    }
+
+    setActiveTimelineId(timelineId)
+    updateSettings((prev) => ({ ...prev, defaultTimelineId: timelineId }))
+  }, [updateSettings])
 
   const handleCreateProjectFromCurrent = useCallback((options = {}) => {
     const suggestedName = options.suggestedName || `${activeProjectMeta?.name || 'Project'} Copy`
@@ -2492,22 +2584,12 @@ function StudioPage() {
   const publishStatusLabel = publishedDocument
     ? `Published r${publishedDocument.publishRevision}`
     : 'Not published'
-  const publishMetaLabel = publishedDocument
-    ? `${publishStatusLabel} · ${formatRuntimeTimestamp(publishedDocument.publishedAt)}`
-    : publishStatusLabel
   const publishStateLabel = !publishedDocument
     ? 'Published: Not published'
     : publishIsOutdated
       ? 'Published: Outdated'
       : 'Published: Up to date'
   const activeProjectLabel = activeProjectMeta?.name || 'Untitled Project'
-  const lastSaveLabel = formatRuntimeTimestamp(savedDocument?.savedAt)
-  const lastPublishLabel = formatRuntimeTimestamp(publishedDocument?.publishedAt)
-  const runtimeLineageTimelineLabel = previewRuntimeTimelineId || 'unknown'
-  const runtimeLineageSelectedTimelineLabel = previewRuntimePayload?.selectedTimelineId || runtimeLineageTimelineLabel
-  const runtimeLineageRevisionLabel = previewRuntimePublishRevision || 0
-  const runtimeLineageRestartLabel = previewRuntimeRestartToken || 'local-default'
-  const runtimeLineageHashLabel = previewRuntimePayloadHash || '00000000'
   const currentVerificationLineage = useMemo(() => ({
     projectId: activeProjectId || undefined,
     publishRevision: publishedDocument?.publishRevision || undefined,
@@ -4249,17 +4331,7 @@ function StudioPage() {
                     </label>
                     <label className="studio-menu-field">
                       <span>Timeline</span>
-                      <select
-                        value={activeTimelineId || timelineOptions[0]}
-                        onChange={(event) => {
-                          setActiveTimelineId(event.target.value)
-                          updateSettings((prev) => ({ ...prev, defaultTimelineId: event.target.value }))
-                        }}
-                      >
-                        {timelineOptions.map((timelineId) => (
-                          <option key={timelineId} value={timelineId}>{timelineId}</option>
-                        ))}
-                      </select>
+                      <strong>{selectedTimeline?.name || activeTimelineId || timelineOptions[0] || 'None'}</strong>
                     </label>
                     <label className="studio-menu-field">
                       <span>Preset</span>
@@ -4523,16 +4595,17 @@ function StudioPage() {
               <div className="asset-group-label">Weather</div>
               <div className="asset-section">
                 <div className="asset-section-label">Timelines</div>
+                <p className="asset-empty">Click a timeline to inspect it. Use Inspector Active Timeline to activate it.</p>
                 <div className="asset-list rail-compact card-size-compact asset-list--dense">
                   {filteredTimelines.map((timeline) => (
                     <button
                       key={timeline.id}
                       type="button"
-                      className={`asset-card ${(timeline.id === activeTimelineId || (assetBrowserSelection?.type === 'timeline' && assetBrowserSelection?.id === timeline.id)) ? 'active' : ''}`}
+                      className={`asset-card ${assetBrowserSelection?.type === 'timeline' && assetBrowserSelection?.id === timeline.id ? 'active' : ''}`}
                       onClick={() => setAssetBrowserSelection({ type: 'timeline', id: timeline.id })}
                     >
                       <span className="asset-item-main"><span className="asset-item-icon">▤</span>{timeline.name}</span>
-                      <small>{timeline.id}</small>
+                      <small>{timeline.id === activeTimelineId ? `${timeline.id} (active)` : timeline.id}</small>
                     </button>
                   ))}
                   {!filteredTimelines.length ? <p className="asset-empty">No matching timelines</p> : null}
@@ -4925,10 +4998,7 @@ function StudioPage() {
                         Active Timeline
                         <select
                           value={activeTimelineId || timelineOptions[0]}
-                          onChange={(event) => {
-                            setActiveTimelineId(event.target.value)
-                            updateSettings((prev) => ({ ...prev, defaultTimelineId: event.target.value }))
-                          }}
+                          onChange={(event) => handleActiveTimelineChange(event.target.value)}
                         >
                           {timelineOptions.map((id) => (
                             <option key={id} value={id}>{id}</option>
@@ -4958,15 +5028,13 @@ function StudioPage() {
                     <div className="inspector-group">
                       <h4>Timeline</h4>
                       <div className="inspector-summary-row"><span>Inspected</span><span>{inspectedTimeline?.name || 'Active timeline'}</span></div>
+                      <div className="inspector-summary-row"><span>Active</span><span>{selectedTimeline?.name || activeTimelineId || 'None'}</span></div>
+                      <p className="asset-empty">Asset Browser timeline clicks inspect only. Use Active Timeline here to drive preview and save.</p>
                       <label>
                         Active Timeline
                         <select
                           value={activeTimelineId || timelineOptions[0]}
-                          onChange={(event) => {
-                            setActiveTimelineId(event.target.value)
-                            updateSettings((prev) => ({ ...prev, defaultTimelineId: event.target.value }))
-                            setAssetBrowserSelection({ type: 'timeline', id: event.target.value })
-                          }}
+                          onChange={(event) => handleActiveTimelineChange(event.target.value)}
                         >
                           {timelineOptions.map((id) => (
                             <option key={id} value={id}>{id}</option>
@@ -5672,40 +5740,9 @@ function StudioPage() {
             <span className={`studio-footer-chip${hasUnsavedChanges ? ' is-warning' : ' is-ok'}`}>
               Working: {saveStatusLabel}
             </span>
-            <span className="studio-footer-chip">
-              Saved: {savedDocument ? `r${savedDocument.savedRevision}` : 'none'}
-            </span>
             <span className={`studio-footer-chip${publishIsOutdated ? ' is-warning' : ' is-ok'}`}>
               {publishStateLabel}
             </span>
-            <span className="studio-footer-chip">
-              {publishMetaLabel}
-            </span>
-            <span className="studio-footer-chip">
-              Last save: {lastSaveLabel}
-            </span>
-            <span className="studio-footer-chip">
-              Last publish: {lastPublishLabel}
-            </span>
-            {process.env.NODE_ENV === 'development' ? (
-              <>
-                <span className="studio-footer-chip">
-                  timelineId: {runtimeLineageSelectedTimelineLabel}
-                </span>
-                <span className="studio-footer-chip">
-                  runtimeTimelineId: {runtimeLineageTimelineLabel}
-                </span>
-                <span className="studio-footer-chip">
-                  publishRevision: {runtimeLineageRevisionLabel}
-                </span>
-                <span className="studio-footer-chip">
-                  restartToken: {runtimeLineageRestartLabel}
-                </span>
-                <span className="studio-footer-chip">
-                  runtimePayloadHash: {runtimeLineageHashLabel}
-                </span>
-              </>
-            ) : null}
             {projectLoadWarning ? (
               <span className="studio-footer-chip is-warning">
                 Warning: {projectLoadWarning}

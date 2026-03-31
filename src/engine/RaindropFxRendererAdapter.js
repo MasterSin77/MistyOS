@@ -57,6 +57,19 @@ const loadRaindropFxScript = () => {
   return scriptState.promise
 }
 
+const resetRaindropFxScriptState = () => {
+  scriptState.promise = null
+  const existing = document.querySelector('script[data-raindropfx="true"]')
+  if (existing) {
+    existing.remove()
+  }
+  try {
+    delete window.RaindropFX
+  } catch {
+    window.RaindropFX = undefined
+  }
+}
+
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value))
 
 const toNumber = (value, fallback = 0) => {
@@ -127,6 +140,8 @@ export class RaindropFxRendererAdapter {
     this.nativeEntitiesOnlyDebug = query.get('rdfxNativeOnly') === '1'
     this.baselineSeedDebugEnabled = query.get('rdfxBaselineSeedDebug') === '1'
     this.sizePipelineProofEnabled = query.get('rdfxSizeProof') === '1' || this.baselineSeedDebugEnabled
+    this.spawnSizeOverrideMin = Number.isFinite(Number(query.get('rdfxSpawnSizeMin'))) ? Number(query.get('rdfxSpawnSizeMin')) : null
+    this.spawnSizeOverrideMax = Number.isFinite(Number(query.get('rdfxSpawnSizeMax'))) ? Number(query.get('rdfxSpawnSizeMax')) : null
     this.diagnostics = null
     this.sizePipelineProof = {
       enabled: this.sizePipelineProofEnabled,
@@ -168,10 +183,213 @@ export class RaindropFxRendererAdapter {
       baselineSeedDiagnosticsEnabled: this.baselineSeedDebugEnabled,
       sizePipelineProofEnabled: this.sizePipelineProofEnabled,
       lastError: null,
+      glState: {
+        viewport: [0, 0, width, height],
+        canvasWidth: width,
+        canvasHeight: height,
+        scissorTestEnabled: null,
+        lastResetReason: 'constructor',
+      },
     }
+    this.glStateLogCount = 0
     this.canvas = document.createElement('canvas')
     this.canvas.width = width
     this.canvas.height = height
+  }
+
+  getWebGLContext() {
+    const candidates = [
+      this.instance?.renderer?.renderer?.gl,
+      this.instance?.renderer?.gl,
+      this.instance?.renderer?.renderer?.ctx?.gl,
+      this.instance?.renderer?.ctx?.gl,
+    ]
+
+    for (const candidate of candidates) {
+      if (candidate && typeof candidate.viewport === 'function') {
+        return candidate
+      }
+    }
+
+    const fallback = this.canvas?.getContext?.('webgl2') || this.canvas?.getContext?.('webgl')
+    return fallback && typeof fallback.viewport === 'function' ? fallback : null
+  }
+
+  getCompositeSourceCanvas() {
+    const expectedWidth = Math.max(1, Math.floor(this.width || this.canvas?.width || 1))
+    const expectedHeight = Math.max(1, Math.floor(this.height || this.canvas?.height || 1))
+    const isUsableCanvas = (canvas) => {
+      return Boolean(
+        canvas
+        && typeof canvas.width === 'number'
+        && typeof canvas.height === 'number'
+        && canvas.width > 0
+        && canvas.height > 0
+      )
+    }
+
+    // Keep the adapter-owned canvas authoritative for 2D compositing.
+    // Internal renderer canvases can survive remounts in stale states and leak wedge artifacts.
+    if (isUsableCanvas(this.canvas)) {
+      const widthMatches = Math.abs(this.canvas.width - expectedWidth) <= 1
+      const heightMatches = Math.abs(this.canvas.height - expectedHeight) <= 1
+      if (widthMatches && heightMatches) {
+        return {
+          source: 'adapter.canvas',
+          canvas: this.canvas,
+        }
+      }
+    }
+
+    const candidates = [
+      {
+        source: 'renderer.renderer.gl.canvas',
+        canvas: this.instance?.renderer?.renderer?.gl?.canvas,
+      },
+      {
+        source: 'renderer.gl.canvas',
+        canvas: this.instance?.renderer?.gl?.canvas,
+      },
+      {
+        source: 'renderer.renderer.ctx.canvas',
+        canvas: this.instance?.renderer?.renderer?.ctx?.canvas,
+      },
+      {
+        source: 'renderer.ctx.canvas',
+        canvas: this.instance?.renderer?.ctx?.canvas,
+      },
+      {
+        source: 'adapter.canvas',
+        canvas: this.canvas,
+      },
+    ]
+
+    for (const candidate of candidates) {
+      const canvas = candidate.canvas
+      if (isUsableCanvas(canvas)) {
+        return {
+          source: candidate.source,
+          canvas,
+        }
+      }
+    }
+
+    return {
+      source: 'none',
+      canvas: null,
+    }
+  }
+
+  resetRenderState(reason = 'unknown') {
+    const gl = this.getWebGLContext()
+    const compositeSource = this.getCompositeSourceCanvas()
+    const activeCanvas = compositeSource.canvas || this.canvas
+    const width = Math.max(1, Math.floor(activeCanvas?.width || this.width || 1))
+    const height = Math.max(1, Math.floor(activeCanvas?.height || this.height || 1))
+
+    if (!gl) {
+      this.debug.glState = {
+        viewport: [0, 0, width, height],
+        canvasWidth: width,
+        canvasHeight: height,
+        drawingBufferWidth: width,
+        drawingBufferHeight: height,
+        scissorTestEnabled: null,
+        framebufferBinding: 'unavailable',
+        compositeSource: compositeSource.source,
+        compositeCanvasMatchesAdapter: activeCanvas === this.canvas,
+        lastResetReason: reason,
+      }
+      return false
+    }
+
+    this.instance?.renderer?.renderer?.use?.()
+
+    if (typeof gl.bindFramebuffer === 'function') {
+      if (typeof gl.DRAW_FRAMEBUFFER === 'number') {
+        gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null)
+      }
+      if (typeof gl.READ_FRAMEBUFFER === 'number') {
+        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null)
+      }
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    }
+    if (typeof gl.bindRenderbuffer === 'function') {
+      gl.bindRenderbuffer(gl.RENDERBUFFER, null)
+    }
+    if (typeof gl.bindVertexArray === 'function') {
+      gl.bindVertexArray(null)
+    }
+    if (typeof gl.useProgram === 'function') {
+      gl.useProgram(null)
+    }
+
+    gl.viewport(0, 0, width, height)
+    if (typeof gl.disable === 'function' && typeof gl.CULL_FACE === 'number') {
+      gl.disable(gl.CULL_FACE)
+    }
+    if (typeof gl.disable === 'function' && typeof gl.SCISSOR_TEST === 'number') {
+      gl.disable(gl.SCISSOR_TEST)
+    }
+    if (typeof gl.scissor === 'function') {
+      gl.scissor(0, 0, width, height)
+    }
+    if (typeof gl.colorMask === 'function') {
+      gl.colorMask(true, true, true, true)
+    }
+    if (typeof gl.depthMask === 'function') {
+      gl.depthMask(true)
+    }
+    if (typeof gl.clearDepth === 'function') {
+      gl.clearDepth(1)
+    }
+    gl.clearColor(0, 0, 0, 0)
+    let clearMask = gl.COLOR_BUFFER_BIT
+    if (typeof gl.DEPTH_BUFFER_BIT === 'number') {
+      clearMask |= gl.DEPTH_BUFFER_BIT
+    }
+    gl.clear(clearMask)
+
+    const viewport = typeof gl.getParameter === 'function'
+      ? Array.from(gl.getParameter(gl.VIEWPORT) || [0, 0, width, height])
+      : [0, 0, width, height]
+    const scissorTestEnabled = typeof gl.isEnabled === 'function' && typeof gl.SCISSOR_TEST === 'number'
+      ? gl.isEnabled(gl.SCISSOR_TEST)
+      : null
+    const framebufferBinding = typeof gl.getParameter === 'function' && typeof gl.FRAMEBUFFER_BINDING === 'number'
+      ? (gl.getParameter(gl.FRAMEBUFFER_BINDING) ? 'custom' : 'default')
+      : 'unknown'
+
+    this.debug.glState = {
+      viewport,
+      canvasWidth: width,
+      canvasHeight: height,
+      drawingBufferWidth: Number(gl.drawingBufferWidth || width),
+      drawingBufferHeight: Number(gl.drawingBufferHeight || height),
+      scissorTestEnabled,
+      framebufferBinding,
+      compositeSource: compositeSource.source,
+      compositeCanvasMatchesAdapter: activeCanvas === this.canvas,
+      lastResetReason: reason,
+    }
+
+    if (this.glStateLogCount < 8 || reason.includes('destroy')) {
+      console.info('[RaindropFxRendererAdapter][render-reset]', {
+        reason,
+        viewport,
+        canvasWidth: width,
+        canvasHeight: height,
+        drawingBufferWidth: Number(gl.drawingBufferWidth || width),
+        drawingBufferHeight: Number(gl.drawingBufferHeight || height),
+        scissorTestEnabled,
+        framebufferBinding,
+        compositeSource: compositeSource.source,
+        compositeCanvasMatchesAdapter: activeCanvas === this.canvas,
+      })
+      this.glStateLogCount += 1
+    }
+
+    return true
   }
 
   async init() {
@@ -222,6 +440,7 @@ export class RaindropFxRendererAdapter {
       // The bundle relies on a global GL context registry (Wt/L); bind it explicitly
       // before any asset init to avoid "without global gl context" failures.
       this.instance.renderer?.renderer?.use?.()
+  this.resetRenderState('init:post-use')
 
       const options = this.instance.options || {}
       this.debug.simulatorSpawnInterval = options.spawnInterval ?? null
@@ -230,10 +449,20 @@ export class RaindropFxRendererAdapter {
       this.debug.proceduralMistEnabled = options.mist ?? null
 
       // Use only the original rendering pipeline and keep simulation external.
-      await this.instance.renderer.loadAssets()
+      try {
+        await this.instance.renderer.loadAssets()
+      } catch (error) {
+        // Optional media (for example, ambient audio/background assets) can fail in
+        // local dev without preventing the rain simulation from running.
+        this.debug.assetLoadWarning = error instanceof Error ? error.message : String(error)
+      }
       this.ready = true
       this.debug.initCompleted = true
       this.debug.lastError = null
+      // Apply latest canvas size after async init so resize callbacks that fired
+      // during boot do not call into a half-initialized bundle state.
+      this.instance.resize(this.width, this.height)
+      this.resetRenderState('init:post-resize')
       this.applyRuntimeSettings()
       this.installSizePipelineProofHooks()
     } catch (error) {
@@ -250,8 +479,32 @@ export class RaindropFxRendererAdapter {
     this.canvas.width = this.width
     this.canvas.height = this.height
 
-    if (this.instance) {
+    if (this.instance && this.ready) {
       this.instance.resize(this.width, this.height)
+      this.resetRenderState('resize')
+    }
+  }
+
+  primeDisplaySurface(reason = 'unknown') {
+    if (!this.instance || !this.ready) {
+      return false
+    }
+
+    const renderer = this.instance.renderer
+    const simulatorRaindrops = collectEntityList(this.instance.simulator?.raindrops)
+    if (!renderer || typeof renderer.render !== 'function') {
+      return false
+    }
+
+    try {
+      this.resetRenderState(`prime:${reason}:pre`)
+      renderer.render(simulatorRaindrops, { dt: 1 / 60, total: 0 })
+      this.debug.lastPrimeReason = reason
+      return true
+    } catch (error) {
+      this.debug.lastPrimeReason = `${reason}:failed`
+      this.debug.lastError = error instanceof Error ? error.message : String(error)
+      return false
     }
   }
 
@@ -259,6 +512,8 @@ export class RaindropFxRendererAdapter {
     this.background = background
     if (this.instance) {
       await this.instance.setBackground(background)
+      this.resetRenderState('background')
+      this.primeDisplaySurface('background')
     }
   }
 
@@ -354,47 +609,10 @@ export class RaindropFxRendererAdapter {
     const spawnIntervalMaxSec = Math.min(maxInterArrivalMs / 1000, baseInterArrivalSec * burstScale)
     const spawnIntervalTuple = rangeTuple(spawnIntervalMinSec, spawnIntervalMaxSec, 0.001, 5)
 
-    const sizeMin = clamp(toNumber(baselineBehavior.sizeModel?.diameterPxAt1080p?.hardClamp?.min, 1.4), 0.1, 100)
-    const sizeMax = clamp(toNumber(baselineBehavior.sizeModel?.diameterPxAt1080p?.hardClamp?.max, 9.5), sizeMin, 200)
-    // Frozen RaindropFX simulator expects larger spawn-size units (~60..100 defaults).
-    // Preserve seed-driven relative behavior by projecting diameter px into simulator units.
-    //
-    // Size upper bound: use the mixture-weighted mean diameter to derive a distribution-matching
-    // max for uniform sampling, instead of the raw hard-clamp max.
-    // For a uniform [min, max] to have the same mean as the lognormal mixture:
-    //   distribMax = 2 * mixMean - sizeMin
-    // This shifts the spawn distribution toward fine/medium drops (seed: 58%+32%=90%)
-    // and stops over-representing the large-drop tail (seed: 10% but uniform gives ~37%).
-    // Large drops still emerge through merging; runner thresholds self-adjust below.
-      // Spawn size upper bound: derive from the mixture-weighted arithmetic mean of the
-      // lognormal components.  For a lognormal component with parameters (mu, sigma), the
-      // arithmetic mean is exp(mu + sigma²/2) — using sigma here (not just mu) prevents
-      // the distribMaxPx from collapsing to the sizeMax fallback when components are present.
-      //
-      // For a uniform[sizeMin, distribMax] to match that weighted mean:
-      //   distribMax = 2 * mixMean - sizeMin
-      // This concentrates spawns in the fine+medium feeder band (seed: 58%+32%=90%)
-      // and reserves large drops for accumulation rather than direct spawning.
-      const mixComponentsArr = baselineBehavior.sizeModel?.diameterPxAt1080p?.components
-      let mixMeanPx
-      if (Array.isArray(mixComponentsArr) && mixComponentsArr.length > 0) {
-        let totalWeight = 0
-        let weightedMean = 0
-        for (const c of mixComponentsArr) {
-          const w = toNumber(c.weight, 0)
-          const mu = toNumber(c.mu, 0)
-          const sig = toNumber(c.sigma, 0.2)
-          // Arithmetic mean of lognormal(mu, sigma) = exp(mu + sigma²/2)
-          weightedMean += w * Math.exp(mu + (sig * sig) / 2)
-          totalWeight += w
-        }
-        mixMeanPx = totalWeight > 0.001 ? weightedMean / totalWeight : (sizeMin + sizeMax) / 2
-      } else {
-        mixMeanPx = (sizeMin + sizeMax) / 2
-      }
-      // distribMax bounded by sizeMax so we never exceed the seed hard clamp.
-      const distribMaxPx = clamp(2 * mixMeanPx - sizeMin, sizeMin + 0.5, sizeMax)
-      const simulatorSpawnSize = rangeTuple(sizeMin * 10, distribMaxPx * 10, 4, 240)
+    const sizeMinFromSeed = clamp(toNumber(baselineBehavior.sizeModel?.diameterPxAt1080p?.hardClamp?.min, 1.4), 0.1, 100)
+    const sizeMaxFromSeed = clamp(toNumber(baselineBehavior.sizeModel?.diameterPxAt1080p?.hardClamp?.max, 9.5), sizeMinFromSeed, 200)
+    const sizeMin = this.spawnSizeOverrideMin == null ? sizeMinFromSeed : clamp(this.spawnSizeOverrideMin, 0.1, 100)
+    const sizeMax = this.spawnSizeOverrideMax == null ? sizeMaxFromSeed : clamp(this.spawnSizeOverrideMax, sizeMin, 200)
 
     const mergeNeighborhood = clamp(toNumber(baselineBehavior.mergeModel?.neighborhoodRadiusPxAt1080p, 2.4), 0.2, 20)
     const mergeRatioLimit = clamp(toNumber(baselineBehavior.mergeModel?.sizeRatioLimitForMerge, 4.5), 0.5, 20)
@@ -437,7 +655,10 @@ export class RaindropFxRendererAdapter {
     }
 
     simOptions.spawnInterval = spawnIntervalTuple
-    simOptions.spawnSize = simulatorSpawnSize
+    // Surface 1: hardClamp min/max are the direct spawn-size authority in baseline-seed mode.
+    simOptions.spawnSize = Array.isArray(simOptions.spawnSize) ? simOptions.spawnSize : [sizeMin, sizeMax]
+    simOptions.spawnSize[0] = sizeMin
+    simOptions.spawnSize[1] = sizeMax
     // Multiplier 6.0 ≈ expected drop lifetime budget at steady state (2–10 s per drop at 62/s).
     // The prior 2.4× was too low; drops with merging and trail persistence accumulate beyond
     // that headroom, so new spawns were being gated before steady-state density was reached.
@@ -467,8 +688,8 @@ export class RaindropFxRendererAdapter {
     simOptions.slipRate = clamp(0.08, 0, 0.95)
 
     // Direct 1:1 runner option mappings — runtime now exposes these gates natively.
-    const minMass = simulatorSpawnSize[0] ** 2
-    const maxMass = simulatorSpawnSize[1] ** 2
+  const minMass = simOptions.spawnSize[0] ** 2
+  const maxMass = simOptions.spawnSize[1] ** 2
     simOptions.runnerSplitMassThreshold = clamp(minMass + runnerMassThreshold0to1 * (maxMass - minMass), 1, 1e6)
     simOptions.runnerSplitProbability = runnerProbability
     simOptions.runnerSpeedMultiplier = runnerSpeedMultiplier
@@ -764,6 +985,7 @@ export class RaindropFxRendererAdapter {
       const updateResultList = collectEntityList(updateResult)
       const simulatorRaindrops = collectEntityList(simulator.raindrops)
 
+      this.resetRenderState('render:pre')
       renderer.render(simulatorRaindrops, normalizedFrame)
 
       this.lastSimulatorSnapshot = simulatorRaindrops.map((drop, index) => this.normalizeSimulatorDrop(drop, index))
@@ -797,20 +1019,35 @@ export class RaindropFxRendererAdapter {
   }
 
   getDebugState() {
+    const compositeSource = this.getCompositeSourceCanvas()
     return {
       ready: this.ready,
       ...this.debug,
       inputScale: { ...this.inputScale },
       flipYAxis: this.flipYAxis,
+      compositeSource: {
+        source: compositeSource.source,
+        canvasWidth: Number(compositeSource.canvas?.width || 0),
+        canvasHeight: Number(compositeSource.canvas?.height || 0),
+        matchesAdapterCanvas: compositeSource.canvas === this.canvas,
+      },
       sizePipelineProof: this.getSizePipelineProofReport(),
     }
   }
 
   destroy() {
     if (this.instance) {
-      this.instance.destroy()
+      this.resetRenderState('destroy:pre')
+      if (typeof this.instance.destroy === 'function') {
+        this.instance.destroy()
+      } else if (typeof this.instance.stop === 'function') {
+        this.instance.stop()
+      }
       this.instance = null
     }
+    resetRaindropFxScriptState()
+    this.canvas.width = Math.max(1, Math.floor(this.width || this.canvas.width || 1))
+    this.canvas.height = Math.max(1, Math.floor(this.height || this.canvas.height || 1))
     this.lastSimulatorSnapshot = []
     this.entityIdByRef = new WeakMap()
     this.ready = false

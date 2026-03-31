@@ -3,12 +3,12 @@ const clamp = (value, min, max) => Math.max(min, Math.min(max, value))
 export const DEFAULT_TUNING_CONFIG = {
   surfaceWetness: {
     initialWetness: 0.12,
-    maxWetness: 0.55,
-    refillRate: 0.005,
-    recoveryRate: 1.25,
+    maxWetness: 0.36,
+    refillRate: 0.0024,
+    recoveryRate: 1.16,
     diffusionRate: 6.2,
-    trailRecoveryRate: 0.58,
-    runnerMemoryRecoveryRate: 0.29,
+    trailRecoveryRate: 1.18,
+    runnerMemoryRecoveryRate: 0.82,
   },
   fogSurface: {
     baseFogLevel: 0,
@@ -17,18 +17,20 @@ export const DEFAULT_TUNING_CONFIG = {
     fogAlphaMultiplier: 0,
     smoothingPassCount: 1,
     fogFillBoost: 0,
-    wetnessFogGain: 2.2,
-    wetnessSoftnessGain: 1.8,
-    trailMistGain: 4.8,
-    runnerChannelGain: 5.2,
-    runnerChannelThreshold: 0.045,
+    wetnessFogGain: 1.08,
+    wetnessSoftnessGain: 0.96,
+    trailMistGain: 2.35,
+    runnerChannelGain: 6,
+    runnerChannelThreshold: 0.02,
+    densityResponsiveClearGain: 0.95,
+    densityResponsiveClearPersistence: 0.7,
     debugSurfaceContrast: 2.2,
   },
   dropletInteraction: {
-    headClearStrength: 1,
-    headClearRadiusMultiplier: 1,
-    trailClearStrength: 0.78,
-    trailClearRadiusMultiplier: 0.86,
+    headClearStrength: 1.28,
+    headClearRadiusMultiplier: 1.08,
+    trailClearStrength: 1.18,
+    trailClearRadiusMultiplier: 0.96,
     largeRunnerSizeGateStart: 1.45,
     largeRunnerSizeGateRange: 1.55,
     largeRunnerMassGateStart: 2.2,
@@ -127,12 +129,12 @@ export const mergeDeep = (base, override) => {
 
 export const getLinkedEffectiveConfig = (inputConfig) => {
   const cfg = deepClone(inputConfig)
-  const mistDensity = clamp(cfg.links?.mistDensity ?? 1, 0, 2)
-  const fogSoftness = clamp(cfg.links?.fogSoftness ?? 1, 0.4, 2)
+  const mistDensity = clamp(cfg.links?.mistDensity ?? 1, 0, 1.55)
+  const fogSoftness = clamp(cfg.links?.fogSoftness ?? 1, 0.4, 1.6)
   const largeRunnerInfluence = clamp(cfg.links?.largeRunnerInfluence ?? 1, 0, 2)
 
-  cfg.surfaceWetness.initialWetness = clamp(cfg.fogSurface.baseFogLevel * (0.7 + mistDensity * 0.5), 0, 0.95)
-  cfg.surfaceWetness.refillRate = clamp(cfg.surfaceWetness.refillRate * (0.55 + mistDensity * 0.85), 0, 0.08)
+  cfg.surfaceWetness.initialWetness = clamp(cfg.fogSurface.baseFogLevel * (0.6 + mistDensity * 0.32), 0, 0.65)
+  cfg.surfaceWetness.refillRate = clamp(cfg.surfaceWetness.refillRate * (0.48 + mistDensity * 0.58), 0, 0.06)
   cfg.renderer.mistColorA = clamp(cfg.renderer.mistColorA * (0.45 + mistDensity * 0.85), 0, 1)
 
   cfg.surfaceWetness.diffusionRate = clamp(cfg.surfaceWetness.diffusionRate * (0.55 + fogSoftness * 0.9), 0, 20)
@@ -164,8 +166,8 @@ export const TUNING_SCHEMA = [
     title: 'Surface Wetness',
     controls: [
       { path: 'surfaceWetness.initialWetness', label: 'Initial Wetness', min: 0, max: 0.8, step: 0.005, tooltip: 'Base condensation level before local clearing.' },
-      { path: 'surfaceWetness.maxWetness', label: 'Max Wetness', min: 0.1, max: 1, step: 0.01, tooltip: 'Upper cap for condensation opacity.' },
-      { path: 'surfaceWetness.refillRate', label: 'Refill Rate', min: 0, max: 0.03, step: 0.0005, tooltip: 'How quickly condensation rebuilds globally.' },
+      { path: 'surfaceWetness.maxWetness', label: 'Max Wetness', min: 0.1, max: 0.65, step: 0.01, tooltip: 'Upper cap for condensation opacity.' },
+      { path: 'surfaceWetness.refillRate', label: 'Refill Rate', min: 0, max: 0.015, step: 0.0005, tooltip: 'How quickly condensation rebuilds globally.' },
       { path: 'surfaceWetness.recoveryRate', label: 'Recovery Rate', min: 0, max: 4, step: 0.05, tooltip: 'How quickly disturbed clear zones relax back.' },
       { path: 'surfaceWetness.diffusionRate', label: 'Diffusion Rate', min: 0, max: 12, step: 0.1, tooltip: 'How quickly cleared regions spread into neighbors.' },
       { path: 'surfaceWetness.trailRecoveryRate', label: 'Trail Recovery', min: 0, max: 2, step: 0.02, tooltip: 'Fade speed for trail field history.' },
@@ -176,20 +178,22 @@ export const TUNING_SCHEMA = [
     key: 'fogSurface',
     title: 'Fog / Surface Rendering',
     controls: [
-      { path: 'fogSurface.baseFogLevel', label: 'Base Fog', min: 0, max: 0.5, step: 0.01, tooltip: 'Baseline fog amount used when field resets.' },
+      { path: 'fogSurface.baseFogLevel', label: 'Base Fog', min: 0, max: 0.28, step: 0.01, tooltip: 'Baseline fog amount used when field resets.' },
       { path: 'fogSurface.fogScale', label: 'Fog Scale', min: 0.3, max: 1, step: 0.01, tooltip: 'Resolution scale for fog simulation canvas.' },
       { path: 'fogSurface.fogTintStrength', label: 'Fog Tint', min: 0, max: 0.35, step: 0.005, tooltip: 'Strength of overlay tint over the fog map.' },
-      { path: 'fogSurface.fogAlphaMultiplier', label: 'Fog Alpha', min: 0, max: 2, step: 0.02, tooltip: 'Multiplier for final fog compositing alpha.' },
-      { path: 'fogSurface.fogFillBoost', label: 'Fog Fill Boost', min: 0, max: 0.2, step: 0.001, tooltip: 'Uniform bright fog fill layered on top of the wetness map.' },
-      { path: 'fogSurface.wetnessFogGain', label: 'Wetness Fog Gain', min: 0, max: 8, step: 0.05, tooltip: 'Renderer-side gain for wetness contribution into fog density.' },
-      { path: 'fogSurface.wetnessSoftnessGain', label: 'Wetness Softness Gain', min: 0, max: 8, step: 0.05, tooltip: 'Renderer-side gain for wetness softness contribution into fog density.' },
-      { path: 'fogSurface.trailMistGain', label: 'Trail Mist Gain', min: 0, max: 10, step: 0.05, tooltip: 'Renderer-side gain that exaggerates trail memory in fog/mist coupling.' },
-      { path: 'fogSurface.runnerChannelGain', label: 'Runner Channel Gain', min: 0, max: 12, step: 0.05, tooltip: 'Renderer-side gain that amplifies runner/channel carve suppression of fog.' },
-      { path: 'fogSurface.runnerChannelThreshold', label: 'Runner Channel Threshold', min: 0, max: 0.5, step: 0.005, tooltip: 'Runner memory threshold where carve suppression starts.' },
+      { path: 'fogSurface.fogAlphaMultiplier', label: 'Fog Alpha', min: 0, max: 0.9, step: 0.02, tooltip: 'Multiplier for final fog compositing alpha.' },
+      { path: 'fogSurface.fogFillBoost', label: 'Fog Fill Boost', min: 0, max: 0.04, step: 0.001, tooltip: 'Uniform bright fog fill layered on top of the wetness map.' },
+      { path: 'fogSurface.wetnessFogGain', label: 'Wetness Fog Gain', min: 0, max: 2.8, step: 0.05, tooltip: 'Renderer-side gain for wetness contribution into fog density.' },
+      { path: 'fogSurface.wetnessSoftnessGain', label: 'Wetness Softness Gain', min: 0, max: 2.4, step: 0.05, tooltip: 'Renderer-side gain for wetness softness contribution into fog density.' },
+      { path: 'fogSurface.trailMistGain', label: 'Trail Mist Gain', min: 0, max: 4.2, step: 0.05, tooltip: 'Renderer-side gain that exaggerates trail memory in fog/mist coupling.' },
+      { path: 'fogSurface.runnerChannelGain', label: 'Runner Channel Gain', min: 0, max: 8, step: 0.05, tooltip: 'Renderer-side gain that amplifies runner/channel carve suppression of fog.' },
+      { path: 'fogSurface.runnerChannelThreshold', label: 'Runner Channel Threshold', min: 0, max: 0.28, step: 0.005, tooltip: 'Runner memory threshold where carve suppression starts.' },
+      { path: 'fogSurface.densityResponsiveClearGain', label: 'Density Clear Gain', min: 0, max: 2, step: 0.02, tooltip: 'Scales wetness/path clear strength up as local fog density rises so thick fog stays writable.' },
+      { path: 'fogSurface.densityResponsiveClearPersistence', label: 'Density Clear Persistence', min: 0, max: 2, step: 0.02, tooltip: 'Extends trail/mist/path suppression persistence proportionally to local fog density.' },
       { path: 'fogSurface.debugSurfaceContrast', label: 'Debug Surface Contrast', min: 0.4, max: 5, step: 0.05, tooltip: 'Contrast curve used by debug surface inspection modes.' },
       { path: 'fogSurface.smoothingPassCount', label: 'Smoothing Passes', min: 1, max: 8, step: 1, tooltip: 'Number of wetness smoothing passes each frame.' },
-      { path: 'links.fogSoftness', label: 'Fog Softness Link', min: 0.3, max: 2, step: 0.02, tooltip: 'Linked control driving diffusion and smoothing together.' },
-      { path: 'links.mistDensity', label: 'Mist Density Link', min: 0, max: 2, step: 0.02, tooltip: 'Linked control driving refill, base wetness, and renderer mist alpha.' },
+      { path: 'links.fogSoftness', label: 'Fog Softness Link', min: 0.3, max: 1.6, step: 0.02, tooltip: 'Linked control driving diffusion and smoothing together.' },
+      { path: 'links.mistDensity', label: 'Mist Density Link', min: 0, max: 1.55, step: 0.02, tooltip: 'Linked control driving refill, base wetness, and renderer mist alpha.' },
     ],
   },
   {

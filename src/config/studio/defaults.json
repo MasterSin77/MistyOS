@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "defaultTimelineId": "runner-wake-diagnosis",
   "startupMode": "always-atmospheric",
   "staticStartup": {
     "holdSeconds": 1.8,

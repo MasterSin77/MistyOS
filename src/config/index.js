@@ -1,6 +1,7 @@
 import studioDefaults from './studio/defaults.json'
 import defaultTimeline from './timelines/default-atmosphere.json'
 import runnerCarveDiagnosisTimeline from './timelines/runner-carve-diagnosis.json'
+import runnerWakeDiagnosisTimeline from './timelines/runner-wake-diagnosis.json'
 import corePreset from './presets/core-wet-surface.json'
 import sceneAtrium from './scenes/atrium-still.json'
 import sceneStreet from './scenes/street-gif.json'
@@ -17,7 +18,7 @@ export const STARTUP_MODES = {
 }
 
 export const sceneCatalog = [sceneAtrium, sceneStreet, sceneCity]
-export const timelineCatalog = [defaultTimeline, runnerCarveDiagnosisTimeline]
+export const timelineCatalog = [runnerWakeDiagnosisTimeline, defaultTimeline, runnerCarveDiagnosisTimeline]
 export const presetCatalog = [corePreset]
 
 function deepClone(value) {

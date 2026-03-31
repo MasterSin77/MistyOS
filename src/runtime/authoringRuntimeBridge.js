@@ -418,6 +418,8 @@ export function buildWorkingRuntimePayload({
   loopPlayback,
   settingsSnapshot,
 }) {
+  const hasAuthoredTimeline = Boolean(authoredTimeline && typeof authoredTimeline === 'object')
+
   return {
     schemaVersion: 1,
     selectedSceneId,
@@ -426,8 +428,10 @@ export function buildWorkingRuntimePayload({
     startupMode,
     timelineDurationSec,
     loopPlayback: loopPlayback !== false,
-    normalizedClips: deepClone(normalizedClips || []),
-    authoredTimeline: deepClone(authoredTimeline || null),
+    normalizedClips: hasAuthoredTimeline && Array.isArray(normalizedClips)
+      ? deepClone(normalizedClips)
+      : null,
+    authoredTimeline: hasAuthoredTimeline ? deepClone(authoredTimeline) : null,
     settingsSnapshot: deepClone(settingsSnapshot || {}),
   }
 }
@@ -472,6 +476,22 @@ export function publishSavedAuthoringDocument(savedDocument) {
   if (!normalizedSaved) {
     devLog('publish-skipped', { reason: 'missing-saved-document' })
     return null
+  }
+
+  const activeProject = getActiveProjectDocument()
+  const currentPublished = normalizePublishedDocument(activeProject?.publishedDocument)
+  if (
+    currentPublished
+    && runtimePayloadFingerprint(currentPublished.runtimePayload) === runtimePayloadFingerprint(normalizedSaved.runtimePayload)
+  ) {
+    devLog('publish-skipped', {
+      reason: 'semantically-identical-payload',
+      projectId: activeProject?.metadata?.projectId || 'unknown',
+      publishRevision: currentPublished.publishRevision,
+      fromSavedRevision: currentPublished.fromSavedRevision,
+      savedRevision: normalizedSaved.savedRevision,
+    })
+    return currentPublished
   }
 
   const persistedProject = writeActiveProjectDocument((project) => {

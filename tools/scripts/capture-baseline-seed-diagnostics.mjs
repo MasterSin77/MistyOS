@@ -14,6 +14,11 @@ import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT_DIR = path.join(__dirname, '../..')
+const cliRunIdArg = process.argv.find((arg) => arg.startsWith('--run-id='))
+const RUN_ID = cliRunIdArg
+  ? cliRunIdArg.slice('--run-id='.length)
+  : (process.env.BASELINE_SEED_RUN_ID || new Date().toISOString().replace(/[:.]/g, '-'))
+const OUTPUT_DIR = path.join(ROOT_DIR, 'artifacts', 'experiments', RUN_ID)
 
 const BASELINE_SEED_URL = 'http://127.0.0.1:5173/?rdfxBaselineSeedMode=1&rdfxBaselineSeedDebug=1'
 const DURATION_SECONDS = 65 // Run for 65s to capture past 60s checkpoint
@@ -27,6 +32,7 @@ async function captureBaselineSeedDiagnostics() {
 
   const browser = await playwright.chromium.launch({ headless: true })
   let page = null
+  await fs.mkdir(OUTPUT_DIR, { recursive: true })
   const capturedData = {
     timestamp: new Date().toISOString(),
     checkpoints: {},
@@ -110,7 +116,7 @@ async function captureBaselineSeedDiagnostics() {
     capturedData.finalSnapshot = finalSnapshot
 
     // Write report
-    const reportPath = path.join(ROOT_DIR, 'baseline-seed-diagnostic-capture.json')
+    const reportPath = path.join(OUTPUT_DIR, 'baseline-seed-diagnostic-capture.json')
     await fs.writeFile(reportPath, JSON.stringify(capturedData, null, 2))
     console.log(`\n✓ Report written to ${reportPath}`)
 
@@ -119,7 +125,7 @@ async function captureBaselineSeedDiagnostics() {
     console.error('\n✗ Capture failed:', error.message)
     capturedData.errors.push(error.message)
 
-    const reportPath = path.join(ROOT_DIR, 'baseline-seed-diagnostic-capture-error.json')
+    const reportPath = path.join(OUTPUT_DIR, 'baseline-seed-diagnostic-capture-error.json')
     await fs.writeFile(reportPath, JSON.stringify(capturedData, null, 2))
     throw error
   } finally {
