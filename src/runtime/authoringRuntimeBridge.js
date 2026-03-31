@@ -3,7 +3,14 @@ const STORAGE_KEYS = {
   activeProjectId: 'mistyos.authoring.activeProjectId.v1',
   legacySaved: 'mistyos.authoring.saved.v1',
   legacyPublished: 'mistyos.runtime.published.v1',
+  runtimeSurfacePriority: 'mistyos.runtime.surfacePriority.v1',
 }
+
+const RUNTIME_SURFACE_TYPES = {
+  presentation: 'presentation',
+  studio: 'studio',
+}
+const DEFAULT_RUNTIME_SURFACE_HEARTBEAT_TTL_MS = 5000
 
 const PROJECT_STORAGE_PREFIX = 'mistyos.authoring.project.v1.'
 
@@ -403,8 +410,162 @@ function stableSerialize(value) {
   return JSON.stringify(value)
 }
 
+function normalizeRuntimeSurfaceType(value) {
+  if (value === RUNTIME_SURFACE_TYPES.presentation) {
+    return RUNTIME_SURFACE_TYPES.presentation
+  }
+  if (value === RUNTIME_SURFACE_TYPES.studio) {
+    return RUNTIME_SURFACE_TYPES.studio
+  }
+  return null
+}
+
+function normalizeRuntimeSurfacePriority(candidate) {
+  const heartbeatTtlMs = Number(candidate?.heartbeatTtlMs)
+  const normalizedHeartbeatTtlMs = Number.isFinite(heartbeatTtlMs)
+    ? Math.max(1000, Math.round(heartbeatTtlMs))
+    : DEFAULT_RUNTIME_SURFACE_HEARTBEAT_TTL_MS
+
+  const lastHeartbeatAtMs = Number(candidate?.lastHeartbeatAtMs)
+  const lastVisibilityAtMs = Number(candidate?.lastVisibilityAtMs)
+  const lastFocusAtMs = Number(candidate?.lastFocusAtMs)
+  const activeReason = candidate?.activeReason != null ? String(candidate.activeReason).trim() : ''
+
+  return {
+    schemaVersion: 1,
+    activeSurfaceType: normalizeRuntimeSurfaceType(candidate?.activeSurfaceType),
+    activeSurfaceSessionId: candidate?.activeSurfaceSessionId != null
+      ? String(candidate.activeSurfaceSessionId)
+      : null,
+    activeSurfaceWindowId: candidate?.activeSurfaceWindowId != null
+      ? String(candidate.activeSurfaceWindowId)
+      : null,
+    activeReason: activeReason || null,
+    lastVisibilityAtMs: Number.isFinite(lastVisibilityAtMs) ? Math.max(0, Math.round(lastVisibilityAtMs)) : 0,
+    lastFocusAtMs: Number.isFinite(lastFocusAtMs) ? Math.max(0, Math.round(lastFocusAtMs)) : 0,
+    lastHeartbeatAtMs: Number.isFinite(lastHeartbeatAtMs) ? Math.max(0, Math.round(lastHeartbeatAtMs)) : 0,
+    heartbeatTtlMs: normalizedHeartbeatTtlMs,
+  }
+}
+
+function getRuntimeSurfacePriorityInternal() {
+  return normalizeRuntimeSurfacePriority(getParsedStorageItem(STORAGE_KEYS.runtimeSurfacePriority))
+}
+
+function persistRuntimeSurfacePriority(nextPriority) {
+  const normalized = normalizeRuntimeSurfacePriority(nextPriority)
+  localStorage.setItem(STORAGE_KEYS.runtimeSurfacePriority, JSON.stringify(normalized))
+  notifyKeyChange(STORAGE_KEYS.runtimeSurfacePriority, normalized)
+  return normalized
+}
+
 export function runtimePayloadFingerprint(runtimePayload) {
   return stableSerialize(runtimePayload)
+}
+
+export function getRuntimeSurfacePriorityState() {
+  return getRuntimeSurfacePriorityInternal()
+}
+
+export function resolveRuntimeSurfacePriorityState(candidate, { nowMs = Date.now() } = {}) {
+  const normalized = normalizeRuntimeSurfacePriority(candidate)
+  const lastHeartbeatAtMs = Number(normalized.lastHeartbeatAtMs || 0)
+  const heartbeatTtlMs = Number(normalized.heartbeatTtlMs || DEFAULT_RUNTIME_SURFACE_HEARTBEAT_TTL_MS)
+  const stale = !normalized.activeSurfaceType || !lastHeartbeatAtMs || (Number(nowMs || 0) - lastHeartbeatAtMs) > heartbeatTtlMs
+
+  return {
+    ...normalized,
+    stale,
+    resolvedSurfaceType: stale ? null : normalized.activeSurfaceType,
+    resolvedSurfaceSessionId: stale ? null : normalized.activeSurfaceSessionId,
+    resolvedReason: stale ? null : normalized.activeReason,
+  }
+}
+
+export function publishRuntimeSurfacePriorityHeartbeat({
+  surfaceType,
+  surfaceSessionId,
+  surfaceWindowId,
+  reason,
+  visibilityState,
+  isFocused,
+  heartbeatTtlMs = DEFAULT_RUNTIME_SURFACE_HEARTBEAT_TTL_MS,
+} = {}) {
+  const normalizedSurfaceType = normalizeRuntimeSurfaceType(surfaceType)
+  const normalizedSessionId = surfaceSessionId != null ? String(surfaceSessionId) : null
+  if (!normalizedSurfaceType || !normalizedSessionId) {
+    return getRuntimeSurfacePriorityInternal()
+  }
+
+  const nowMs = Date.now()
+  const normalizedReason = reason != null ? String(reason).trim() : `${normalizedSurfaceType}-focused`
+  const priority = {
+    schemaVersion: 1,
+    activeSurfaceType: normalizedSurfaceType,
+    activeSurfaceSessionId: normalizedSessionId,
+    activeSurfaceWindowId: surfaceWindowId != null ? String(surfaceWindowId) : null,
+    activeReason: normalizedReason || `${normalizedSurfaceType}-focused`,
+    lastVisibilityAtMs: visibilityState === 'visible' ? nowMs : 0,
+    lastFocusAtMs: isFocused ? nowMs : 0,
+    lastHeartbeatAtMs: nowMs,
+    heartbeatTtlMs,
+  }
+
+  return persistRuntimeSurfacePriority(priority)
+}
+
+export function releaseRuntimeSurfacePriorityHeartbeat({ surfaceType, surfaceSessionId } = {}) {
+  const current = getRuntimeSurfacePriorityInternal()
+  const normalizedSurfaceType = normalizeRuntimeSurfaceType(surfaceType)
+  const normalizedSessionId = surfaceSessionId != null ? String(surfaceSessionId) : null
+  if (!normalizedSurfaceType || !normalizedSessionId) {
+    return current
+  }
+
+  if (
+    current.activeSurfaceType !== normalizedSurfaceType
+    || String(current.activeSurfaceSessionId || '') !== normalizedSessionId
+  ) {
+    return current
+  }
+
+  return persistRuntimeSurfacePriority({
+    schemaVersion: 1,
+    activeSurfaceType: null,
+    activeSurfaceSessionId: null,
+    activeSurfaceWindowId: null,
+    activeReason: null,
+    lastVisibilityAtMs: 0,
+    lastFocusAtMs: 0,
+    lastHeartbeatAtMs: Date.now(),
+    heartbeatTtlMs: current.heartbeatTtlMs || DEFAULT_RUNTIME_SURFACE_HEARTBEAT_TTL_MS,
+  })
+}
+
+export function handoffRuntimeSurfaceToPresentation({
+  sourceSurfaceWindowId,
+  reason = 'update-desktop-handoff',
+  heartbeatTtlMs = DEFAULT_RUNTIME_SURFACE_HEARTBEAT_TTL_MS,
+} = {}) {
+  const nowMs = Date.now()
+  const normalizedReason = String(reason || 'update-desktop-handoff').trim() || 'update-desktop-handoff'
+  return persistRuntimeSurfacePriority({
+    schemaVersion: 1,
+    activeSurfaceType: RUNTIME_SURFACE_TYPES.presentation,
+    activeSurfaceSessionId: `handoff-${nowMs}`,
+    activeSurfaceWindowId: sourceSurfaceWindowId != null ? String(sourceSurfaceWindowId) : null,
+    activeReason: normalizedReason,
+    lastVisibilityAtMs: nowMs,
+    lastFocusAtMs: nowMs,
+    lastHeartbeatAtMs: nowMs,
+    heartbeatTtlMs,
+  })
+}
+
+export function subscribeRuntimeSurfacePriorityState(callback) {
+  const notify = () => callback(getRuntimeSurfacePriorityInternal())
+  notify()
+  return subscribeToStorageKey(STORAGE_KEYS.runtimeSurfacePriority, notify)
 }
 
 export function buildWorkingRuntimePayload({

@@ -1,0 +1,88 @@
+{
+  "id": "runner-wake-diagnosis",
+  "name": "Runner Wake Diagnosis",
+  "loop": true,
+  "duration": {
+    "seconds": 145
+  },
+  "weatherTracks": [
+    {
+      "kind": "fogBuildup",
+      "region": "global",
+      "envelope": [
+        { "timeSec": 0, "value": 0.08 },
+        { "timeSec": 15, "value": 0.08 },
+        { "timeSec": 45, "value": 0.18 },
+        { "timeSec": 80, "value": 0.2 },
+        { "timeSec": 110, "value": 0.16 },
+        { "timeSec": 124, "value": 0.82 },
+        { "timeSec": 136, "value": 0.9 },
+        { "timeSec": 145, "value": 0.2 }
+      ]
+    },
+    {
+      "kind": "fogClearing",
+      "region": "global",
+      "envelope": [
+        { "timeSec": 0, "value": 0.16 },
+        { "timeSec": 15, "value": 0.18 },
+        { "timeSec": 45, "value": 0.14 },
+        { "timeSec": 80, "value": 0.1 },
+        { "timeSec": 110, "value": 0.2 },
+        { "timeSec": 124, "value": 0.08 },
+        { "timeSec": 136, "value": 0.36 },
+        { "timeSec": 145, "value": 0.44 }
+      ]
+    },
+    {
+      "kind": "rain",
+      "region": "global",
+      "envelope": [
+        { "timeSec": 0, "value": 0.005 },
+        { "timeSec": 15, "value": 0.01 },
+        { "timeSec": 30, "value": 0.06 },
+        { "timeSec": 45, "value": 0.12 },
+        { "timeSec": 58, "value": 0.28 },
+        { "timeSec": 70, "value": 0.52 },
+        { "timeSec": 80, "value": 0.58 },
+        { "timeSec": 88, "value": 0.12 },
+        { "timeSec": 110, "value": 0.008 },
+        { "timeSec": 145, "value": 0.005 }
+      ]
+    },
+    {
+      "kind": "mist",
+      "region": "global",
+      "envelope": [
+        { "timeSec": 0, "value": 0.02 },
+        { "timeSec": 15, "value": 0.03 },
+        { "timeSec": 45, "value": 0.1 },
+        { "timeSec": 80, "value": 0.12 },
+        { "timeSec": 110, "value": 0.03 },
+        { "timeSec": 124, "value": 0.3 },
+        { "timeSec": 136, "value": 0.34 },
+        { "timeSec": 145, "value": 0.05 }
+      ]
+    },
+    {
+      "kind": "wind",
+      "region": "global",
+      "envelope": [
+        { "timeSec": 0, "value": 0.02 },
+        { "timeSec": 45, "value": 0.03 },
+        { "timeSec": 80, "value": 0.04 },
+        { "timeSec": 110, "value": 0.025 },
+        { "timeSec": 145, "value": 0.02 }
+      ]
+    },
+    {
+      "kind": "washdown",
+      "region": "global",
+      "envelope": [
+        { "timeSec": 0, "value": 0.0 },
+        { "timeSec": 145, "value": 0.0 }
+      ]
+    }
+  ],
+  "intentEvents": []
+}

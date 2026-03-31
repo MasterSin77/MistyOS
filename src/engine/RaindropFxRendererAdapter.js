@@ -177,6 +177,10 @@ export class RaindropFxRendererAdapter {
       proceduralMistEnabled: null,
       frameDt: 0,
       lastFrameTotal: 0,
+      adapterSimulationTimeMs: 0,
+      adapterGlStateResetTimeMs: 0,
+      adapterRendererDrawTimeMs: 0,
+      adapterFrameTimeMs: 0,
       baselineSeedGroupsApplied: null,
       baselineSeedSimulatorOptionSnapshot: null,
       baselineSeedUnsupportedControls: null,
@@ -981,12 +985,21 @@ export class RaindropFxRendererAdapter {
         total: Math.max(0, frame?.total ?? 0),
       }
 
+      const adapterFrameStart = performance.now()
+      const simulationStart = adapterFrameStart
       const updateResult = simulator.update(normalizedFrame)
+      const adapterSimulationTimeMs = performance.now() - simulationStart
       const updateResultList = collectEntityList(updateResult)
       const simulatorRaindrops = collectEntityList(simulator.raindrops)
 
+      const glStateResetStart = performance.now()
       this.resetRenderState('render:pre')
+      const adapterGlStateResetTimeMs = performance.now() - glStateResetStart
+
+      const rendererDrawStart = performance.now()
       renderer.render(simulatorRaindrops, normalizedFrame)
+      const adapterRendererDrawTimeMs = performance.now() - rendererDrawStart
+      const adapterFrameTimeMs = adapterSimulationTimeMs + adapterGlStateResetTimeMs + adapterRendererDrawTimeMs
 
       this.lastSimulatorSnapshot = simulatorRaindrops.map((drop, index) => this.normalizeSimulatorDrop(drop, index))
       this.debug.renderCalls += 1
@@ -996,6 +1009,10 @@ export class RaindropFxRendererAdapter {
       this.debug.simulatorUpdateReturnType = updateResult == null ? 'void' : Array.isArray(updateResult) ? 'array' : typeof updateResult
       this.debug.frameDt = normalizedFrame.dt
       this.debug.lastFrameTotal = normalizedFrame.total
+      this.debug.adapterSimulationTimeMs = adapterSimulationTimeMs
+      this.debug.adapterGlStateResetTimeMs = adapterGlStateResetTimeMs
+      this.debug.adapterRendererDrawTimeMs = adapterRendererDrawTimeMs
+      this.debug.adapterFrameTimeMs = adapterFrameTimeMs
       this.debug.lastError = null
       return true
     } catch (error) {
@@ -1032,6 +1049,15 @@ export class RaindropFxRendererAdapter {
         matchesAdapterCanvas: compositeSource.canvas === this.canvas,
       },
       sizePipelineProof: this.getSizePipelineProofReport(),
+    }
+  }
+
+  getLastFrameTiming() {
+    return {
+      adapterSimulationTimeMs: Number(this.debug.adapterSimulationTimeMs || 0),
+      adapterGlStateResetTimeMs: Number(this.debug.adapterGlStateResetTimeMs || 0),
+      adapterRendererDrawTimeMs: Number(this.debug.adapterRendererDrawTimeMs || 0),
+      adapterFrameTimeMs: Number(this.debug.adapterFrameTimeMs || 0),
     }
   }
 

@@ -104,6 +104,7 @@ export class WetSurfaceEngine {
 
     this.animationFrame = null
     this.running = false
+    this.loopActive = false
     this.firstTickLogged = false
     this.lastTime = performance.now()
     this.tuningConfig = mergeDeep(DEFAULT_TUNING_CONFIG, tuningConfig || {})
@@ -262,6 +263,9 @@ export class WetSurfaceEngine {
       simulationTimeMs: 0,
       renderTimeMs: 0,
       raindropFxUpdateTimeMs: 0,
+      adapterSimulationTimeMs: 0,
+      adapterGlStateResetTimeMs: 0,
+      adapterRendererDrawTimeMs: 0,
       adapterDrawTimeMs: 0,
       surfaceCompositeTimeMs: 0,
       surfaceCompositeTimeMsDetailed: {
@@ -289,6 +293,12 @@ export class WetSurfaceEngine {
       renderedSimulatorRaindropCountRollingMax5s: 0,
       raindropFxUpdateTimeMsRollingMin5s: 0,
       raindropFxUpdateTimeMsRollingMax5s: 0,
+      adapterSimulationTimeMsRollingMin5s: 0,
+      adapterSimulationTimeMsRollingMax5s: 0,
+      adapterGlStateResetTimeMsRollingMin5s: 0,
+      adapterGlStateResetTimeMsRollingMax5s: 0,
+      adapterRendererDrawTimeMsRollingMin5s: 0,
+      adapterRendererDrawTimeMsRollingMax5s: 0,
       gpuFieldsRendererCanvasDomMountActive: false,
       engineMs: 0,
       rendererMs: 0,
@@ -2249,6 +2259,7 @@ export class WetSurfaceEngine {
     }
 
     this.running = true
+    this.loopActive = true
     this.advanceSessionStartupPhase(ENGINE_SESSION_STARTUP_PHASES.BOOTSTRAP_READY, 'engine-start-invoked')
     this.updateSimulationClockPhaseFromStartup()
     this.resize()
@@ -2271,7 +2282,7 @@ export class WetSurfaceEngine {
     this.canvas.addEventListener('pointercancel', this.onPointerUp)
 
     const beginAnimationLoop = () => {
-      if (!this.running || this.animationFrame) {
+      if (!this.running || !this.loopActive || this.animationFrame) {
         return
       }
       const seedNowMs = performance.now()
@@ -2371,6 +2382,7 @@ export class WetSurfaceEngine {
 
   stop() {
     this.running = false
+    this.loopActive = false
     this.advanceSessionStartupPhase(ENGINE_SESSION_STARTUP_PHASES.STOPPED, 'engine-stop-invoked')
     this.updateSimulationClockPhaseFromStartup()
 
@@ -2406,6 +2418,41 @@ export class WetSurfaceEngine {
     this.gpuOverlay = null
     this.disposeGpuWetnessSimulationRuntime()
     this.resetRenderLifecycleState('stop')
+  }
+
+  setLoopActive(active, reason = 'external-control') {
+    const shouldRun = active !== false
+    if (!this.running) {
+      this.loopActive = shouldRun
+      return
+    }
+
+    if (this.loopActive === shouldRun) {
+      return
+    }
+
+    this.loopActive = shouldRun
+    if (!shouldRun) {
+      if (this.animationFrame) {
+        cancelAnimationFrame(this.animationFrame)
+        this.animationFrame = null
+      }
+      this.recordWetnessLifecycleTrace('animation-loop-paused', {
+        reason,
+      })
+      return
+    }
+
+    if (!this.animationFrame) {
+      const seedNowMs = performance.now()
+      this.lastTime = seedNowMs
+      this.sampleSimulationClock(seedNowMs)
+      this.recordWetnessLifecycleTrace('animation-loop-resumed', {
+        reason,
+        seedNowMs: Number(seedNowMs || 0),
+      })
+      this.animationFrame = requestAnimationFrame(this.animate)
+    }
   }
 
   setPhase(nextPhase) {
@@ -5428,7 +5475,7 @@ export class WetSurfaceEngine {
   }
 
   animate(now) {
-    if (!this.running) {
+    if (!this.running || !this.loopActive) {
       return
     }
 
@@ -5461,6 +5508,9 @@ export class WetSurfaceEngine {
     this.timing.simulationTimeMs = 0
     this.timing.renderTimeMs = 0
     this.timing.raindropFxUpdateTimeMs = 0
+    this.timing.adapterSimulationTimeMs = 0
+    this.timing.adapterGlStateResetTimeMs = 0
+    this.timing.adapterRendererDrawTimeMs = 0
     this.timing.adapterDrawTimeMs = 0
     this.timing.surfaceCompositeTimeMs = 0
     this.resetSurfaceCompositeTimingDetails()
@@ -5535,6 +5585,12 @@ export class WetSurfaceEngine {
       }
       this.sampleRendererFrameEnergy()
       rendererMs = performance.now() - rendererStart
+      const adapterFrameTiming = this.raindropRenderer?.getLastFrameTiming?.() ?? null
+      if (adapterFrameTiming) {
+        this.timing.adapterSimulationTimeMs = Number(adapterFrameTiming.adapterSimulationTimeMs || 0)
+        this.timing.adapterGlStateResetTimeMs = Number(adapterFrameTiming.adapterGlStateResetTimeMs || 0)
+        this.timing.adapterRendererDrawTimeMs = Number(adapterFrameTiming.adapterRendererDrawTimeMs || 0)
+      }
     } else if (this.phase >= 2 && this.tuningConfig.debug.freezeRain) {
       this.rendererDebugInfo.renderCalled = false
       this.rendererDebugInfo.renderSucceeded = true
@@ -5771,7 +5827,11 @@ export class WetSurfaceEngine {
     if (runtimeMode === 'gpuFields') {
       this.timing.simulationTimeMs = performance.now() - frameStart
     }
-    this.timing.raindropFxUpdateTimeMs = rendererMs
+    const adapterFrameMeasuredMs =
+      this.timing.adapterSimulationTimeMs
+      + this.timing.adapterGlStateResetTimeMs
+      + this.timing.adapterRendererDrawTimeMs
+    this.timing.raindropFxUpdateTimeMs = adapterFrameMeasuredMs > 0 ? adapterFrameMeasuredMs : rendererMs
 
     const overlayStart = performance.now()
     const viewMode = this.tuningConfig.debug.viewMode
@@ -5935,6 +5995,9 @@ export class WetSurfaceEngine {
       fps: Number(this.timing.fps || 0),
       renderedSimulatorRaindropCount,
       raindropFxUpdateTimeMs: Number(this.timing.raindropFxUpdateTimeMs || 0),
+      adapterSimulationTimeMs: Number(this.timing.adapterSimulationTimeMs || 0),
+      adapterGlStateResetTimeMs: Number(this.timing.adapterGlStateResetTimeMs || 0),
+      adapterRendererDrawTimeMs: Number(this.timing.adapterRendererDrawTimeMs || 0),
     })
     const stabilityCutoffMs = now - this.stabilityReadoutWindowMs
     while (
@@ -5951,17 +6014,32 @@ export class WetSurfaceEngine {
       let countMax = countMin
       let raindropFxUpdateTimeMsMin = Number(this.stabilityReadoutSamples[0]?.raindropFxUpdateTimeMs || 0)
       let raindropFxUpdateTimeMsMax = raindropFxUpdateTimeMsMin
+      let adapterSimulationTimeMsMin = Number(this.stabilityReadoutSamples[0]?.adapterSimulationTimeMs || 0)
+      let adapterSimulationTimeMsMax = adapterSimulationTimeMsMin
+      let adapterGlStateResetTimeMsMin = Number(this.stabilityReadoutSamples[0]?.adapterGlStateResetTimeMs || 0)
+      let adapterGlStateResetTimeMsMax = adapterGlStateResetTimeMsMin
+      let adapterRendererDrawTimeMsMin = Number(this.stabilityReadoutSamples[0]?.adapterRendererDrawTimeMs || 0)
+      let adapterRendererDrawTimeMsMax = adapterRendererDrawTimeMsMin
       for (let index = 1; index < this.stabilityReadoutSamples.length; index += 1) {
         const sample = this.stabilityReadoutSamples[index]
         const sampleFps = Number(sample?.fps || 0)
         const sampleCount = Number(sample?.renderedSimulatorRaindropCount || 0)
         const sampleRaindropFxUpdateTimeMs = Number(sample?.raindropFxUpdateTimeMs || 0)
+        const sampleAdapterSimulationTimeMs = Number(sample?.adapterSimulationTimeMs || 0)
+        const sampleAdapterGlStateResetTimeMs = Number(sample?.adapterGlStateResetTimeMs || 0)
+        const sampleAdapterRendererDrawTimeMs = Number(sample?.adapterRendererDrawTimeMs || 0)
         if (sampleFps < fpsMin) fpsMin = sampleFps
         if (sampleFps > fpsMax) fpsMax = sampleFps
         if (sampleCount < countMin) countMin = sampleCount
         if (sampleCount > countMax) countMax = sampleCount
         if (sampleRaindropFxUpdateTimeMs < raindropFxUpdateTimeMsMin) raindropFxUpdateTimeMsMin = sampleRaindropFxUpdateTimeMs
         if (sampleRaindropFxUpdateTimeMs > raindropFxUpdateTimeMsMax) raindropFxUpdateTimeMsMax = sampleRaindropFxUpdateTimeMs
+        if (sampleAdapterSimulationTimeMs < adapterSimulationTimeMsMin) adapterSimulationTimeMsMin = sampleAdapterSimulationTimeMs
+        if (sampleAdapterSimulationTimeMs > adapterSimulationTimeMsMax) adapterSimulationTimeMsMax = sampleAdapterSimulationTimeMs
+        if (sampleAdapterGlStateResetTimeMs < adapterGlStateResetTimeMsMin) adapterGlStateResetTimeMsMin = sampleAdapterGlStateResetTimeMs
+        if (sampleAdapterGlStateResetTimeMs > adapterGlStateResetTimeMsMax) adapterGlStateResetTimeMsMax = sampleAdapterGlStateResetTimeMs
+        if (sampleAdapterRendererDrawTimeMs < adapterRendererDrawTimeMsMin) adapterRendererDrawTimeMsMin = sampleAdapterRendererDrawTimeMs
+        if (sampleAdapterRendererDrawTimeMs > adapterRendererDrawTimeMsMax) adapterRendererDrawTimeMsMax = sampleAdapterRendererDrawTimeMs
       }
       this.timing.fpsRollingMin5s = fpsMin
       this.timing.fpsRollingMax5s = fpsMax
@@ -5969,6 +6047,12 @@ export class WetSurfaceEngine {
       this.timing.renderedSimulatorRaindropCountRollingMax5s = countMax
       this.timing.raindropFxUpdateTimeMsRollingMin5s = raindropFxUpdateTimeMsMin
       this.timing.raindropFxUpdateTimeMsRollingMax5s = raindropFxUpdateTimeMsMax
+      this.timing.adapterSimulationTimeMsRollingMin5s = adapterSimulationTimeMsMin
+      this.timing.adapterSimulationTimeMsRollingMax5s = adapterSimulationTimeMsMax
+      this.timing.adapterGlStateResetTimeMsRollingMin5s = adapterGlStateResetTimeMsMin
+      this.timing.adapterGlStateResetTimeMsRollingMax5s = adapterGlStateResetTimeMsMax
+      this.timing.adapterRendererDrawTimeMsRollingMin5s = adapterRendererDrawTimeMsMin
+      this.timing.adapterRendererDrawTimeMsRollingMax5s = adapterRendererDrawTimeMsMax
     } else {
       this.timing.fpsRollingMin5s = 0
       this.timing.fpsRollingMax5s = 0
@@ -5976,6 +6060,12 @@ export class WetSurfaceEngine {
       this.timing.renderedSimulatorRaindropCountRollingMax5s = 0
       this.timing.raindropFxUpdateTimeMsRollingMin5s = 0
       this.timing.raindropFxUpdateTimeMsRollingMax5s = 0
+      this.timing.adapterSimulationTimeMsRollingMin5s = 0
+      this.timing.adapterSimulationTimeMsRollingMax5s = 0
+      this.timing.adapterGlStateResetTimeMsRollingMin5s = 0
+      this.timing.adapterGlStateResetTimeMsRollingMax5s = 0
+      this.timing.adapterRendererDrawTimeMsRollingMin5s = 0
+      this.timing.adapterRendererDrawTimeMsRollingMax5s = 0
     }
     this.timing.gpuFieldsRendererCanvasDomMountActive =
       runtimeMode === 'gpuFields' && this.timing.rendererCanvasDomMountActive === true
@@ -6020,6 +6110,9 @@ export class WetSurfaceEngine {
         simulationTimeMs: this.timing.simulationTimeMs,
         renderTimeMs: this.timing.renderTimeMs,
         raindropFxUpdateTimeMs: this.timing.raindropFxUpdateTimeMs,
+        adapterSimulationTimeMs: this.timing.adapterSimulationTimeMs,
+        adapterGlStateResetTimeMs: this.timing.adapterGlStateResetTimeMs,
+        adapterRendererDrawTimeMs: this.timing.adapterRendererDrawTimeMs,
         adapterDrawTimeMs: this.timing.adapterDrawTimeMs,
         surfaceCompositeTimeMs: this.timing.surfaceCompositeTimeMs,
         surfaceCompositeTimeMsDetailed: {
@@ -6043,6 +6136,12 @@ export class WetSurfaceEngine {
         renderedSimulatorRaindropCountRollingMax5s: this.timing.renderedSimulatorRaindropCountRollingMax5s,
         raindropFxUpdateTimeMsRollingMin5s: this.timing.raindropFxUpdateTimeMsRollingMin5s,
         raindropFxUpdateTimeMsRollingMax5s: this.timing.raindropFxUpdateTimeMsRollingMax5s,
+        adapterSimulationTimeMsRollingMin5s: this.timing.adapterSimulationTimeMsRollingMin5s,
+        adapterSimulationTimeMsRollingMax5s: this.timing.adapterSimulationTimeMsRollingMax5s,
+        adapterGlStateResetTimeMsRollingMin5s: this.timing.adapterGlStateResetTimeMsRollingMin5s,
+        adapterGlStateResetTimeMsRollingMax5s: this.timing.adapterGlStateResetTimeMsRollingMax5s,
+        adapterRendererDrawTimeMsRollingMin5s: this.timing.adapterRendererDrawTimeMsRollingMin5s,
+        adapterRendererDrawTimeMsRollingMax5s: this.timing.adapterRendererDrawTimeMsRollingMax5s,
         gpuFieldsRendererCanvasDomMountActive: this.timing.gpuFieldsRendererCanvasDomMountActive,
         engineMs: this.timing.engineMs,
         rendererMs: this.timing.rendererMs,

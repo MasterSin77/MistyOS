@@ -1,0 +1,56 @@
+# IDE retrieval boundary for active coding surfaces
+
+# Primary source and root authority files are intentionally left retrievable:
+# - src/**
+# - package.json
+# - vite.config.ts, vite.config.js
+# - tsconfig*.json
+# - ACTIVE_CONTEXT.md, PHASES.md, REPO_BOUNDARY.md, OPERATIONAL_413_RULES.md, README.md
+
+# Artifacts and generated evidence
+artifacts/**
+
+# Handoff/recovery packages and legacy archives
+handoff/**
+recovery-lab/**
+archive/**
+MistyOS_artifacts_external/**
+**/MistyOS_artifacts_external/**
+
+# Build and dependency outputs
+dist/**
+build/**
+node_modules/**
+coverage/**
+playwright-report/**
+test-results/**
+*.log
+*.tsbuildinfo
+
+# Root one-off capture/test runners and baseline snapshots
+capture-*.mjs
+test-*.mjs
+baseline-seed-*.json
+baseline-seed-*.md
+BASELINE_SEED_*.md
+FINAL_OUTPUT_*.md
+reference-baseline.html
+
+# Docs: default exclude, then allow current authority docs
+docs/**
+!docs/architecture/engine-architecture.md
+!docs/decisions/**
+!docs/metrics/**
+
+# Tools: default exclude, then allow active workflow utilities
+tools/**
+!tools/scripts/**
+!tools/verification/**
+!tools/analysis/*.mjs
+
+# Explicit de-emphasis for historical/non-current utility areas
+tools/logs/**
+tools/perception/**
+
+# Legacy workflow note
+IDE_LLM_WORKFLOW.md

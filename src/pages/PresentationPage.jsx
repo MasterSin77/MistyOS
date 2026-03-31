@@ -4,7 +4,15 @@ import {
   STARTUP_MODES,
 } from '../config'
 import { getLinkedEffectiveConfig } from '../tuning/tuningConfig'
-import { getPublishedRuntimeDocument, subscribePublishedRuntimeDocument } from '../runtime/authoringRuntimeBridge'
+import {
+  getPublishedRuntimeDocument,
+  getRuntimeSurfacePriorityState,
+  publishRuntimeSurfacePriorityHeartbeat,
+  releaseRuntimeSurfacePriorityHeartbeat,
+  resolveRuntimeSurfacePriorityState,
+  subscribePublishedRuntimeDocument,
+  subscribeRuntimeSurfacePriorityState,
+} from '../runtime/authoringRuntimeBridge'
 import {
   resolveRuntimeExecutionFromPayload,
   shortRuntimePayloadHash,
@@ -42,6 +50,10 @@ function devLog(event, details) {
 // Diagnostic-only lineage marker used to classify boot path labels during parity checks.
 // This value never participates in runtime weather/state authority.
 const PRESENTATION_RUNTIME_SESSION_STORAGE_KEY = 'mistyos.presentation.lastRuntimeSessionKey.v1'
+const PRESENTATION_WINDOW_NAME = 'mistyos-presentation-window'
+const RUNTIME_SURFACE_HEARTBEAT_INTERVAL_MS = 1500
+const RUNTIME_SURFACE_HEARTBEAT_TTL_MS = 5000
+const STARTUP_FAIL_OPEN_SETTLE_MS = RUNTIME_SURFACE_HEARTBEAT_INTERVAL_MS * 2
 
 // Hydration parity verifier cache-freshness sentinel. The runtime no longer uses
 // a Presentation-side contract-violation path, but the marker string remains
@@ -97,7 +109,10 @@ function PresentationPage() {
   void PRESENTATION_CONTRACT_VIOLATION_SENTINEL
   const canvasRef = useRef(null)
   const engineRef = useRef(null)
+  const presentationLoopRunningRef = useRef(false)
+  const startupHeartbeatPublishedRef = useRef(false)
   const previousRuntimeSessionKeyRef = useRef(null)
+  const presentationSurfaceSessionIdRef = useRef(`presentation-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
   const bootstrapPathIsRefreshRef = useRef(false)
   const bootParitySnapshotRef = useRef(null)
   const bootParityLoggedSessionRef = useRef(null)
@@ -134,13 +149,108 @@ function PresentationPage() {
   const [atmosphereVisible, setAtmosphereVisible] = useState(true)
   const [latestVerificationArtifact, setLatestVerificationArtifact] = useState(null)
   const [presentationStats, setPresentationStats] = useState({ timing: {} })
+  const [runtimeSurfacePriorityState, setRuntimeSurfacePriorityState] = useState(() => getRuntimeSurfacePriorityState())
+  const [presentationDocumentVisible, setPresentationDocumentVisible] = useState(() => (
+    typeof document !== 'undefined' ? document.visibilityState === 'visible' : false
+  ))
+  const [presentationWindowFocused, setPresentationWindowFocused] = useState(() => (
+    typeof document !== 'undefined' ? document.hasFocus() : false
+  ))
+  const [startupFailOpenActive, setStartupFailOpenActive] = useState(true)
   const [clockDebug, setClockDebug] = useState({
     mode: 'running',
     lastAction: 'initial',
     targetSec: 0,
   })
 
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return
+    }
+    try {
+      if (window.name !== PRESENTATION_WINDOW_NAME) {
+        window.name = PRESENTATION_WINDOW_NAME
+      }
+    } catch {
+      // Ignore browser restrictions; canonical reuse will still use best-effort target semantics.
+    }
+  }, [])
+
   useEffect(() => subscribePublishedRuntimeDocument(stableSetPublishedDocument), [stableSetPublishedDocument])
+
+  useEffect(() => subscribeRuntimeSurfacePriorityState(setRuntimeSurfacePriorityState), [])
+
+  useEffect(() => {
+    const updateVisibilityAndFocus = () => {
+      setPresentationDocumentVisible(document.visibilityState === 'visible')
+      setPresentationWindowFocused(document.hasFocus())
+    }
+
+    updateVisibilityAndFocus()
+    window.addEventListener('focus', updateVisibilityAndFocus)
+    window.addEventListener('blur', updateVisibilityAndFocus)
+    document.addEventListener('visibilitychange', updateVisibilityAndFocus)
+
+    return () => {
+      window.removeEventListener('focus', updateVisibilityAndFocus)
+      window.removeEventListener('blur', updateVisibilityAndFocus)
+      document.removeEventListener('visibilitychange', updateVisibilityAndFocus)
+    }
+  }, [])
+
+  useEffect(() => {
+    const publishHeartbeat = () => {
+      const visibilityState = typeof document !== 'undefined' ? document.visibilityState : 'hidden'
+      const isFocused = typeof document !== 'undefined' ? document.hasFocus() : false
+      const resolvedPriority = resolveRuntimeSurfacePriorityState(getRuntimeSurfacePriorityState())
+      const explicitUpdateDesktopHandoff = (
+        resolvedPriority.resolvedSurfaceType === 'presentation'
+        && resolvedPriority.resolvedReason === 'update-desktop-handoff'
+      )
+      if (visibilityState !== 'visible' || !isFocused) {
+        if (explicitUpdateDesktopHandoff) {
+          return
+        }
+        releaseRuntimeSurfacePriorityHeartbeat({
+          surfaceType: 'presentation',
+          surfaceSessionId: presentationSurfaceSessionIdRef.current,
+        })
+        return
+      }
+
+      publishRuntimeSurfacePriorityHeartbeat({
+        surfaceType: 'presentation',
+        surfaceSessionId: presentationSurfaceSessionIdRef.current,
+        surfaceWindowId: `${window.location.pathname || '/presentation'}:${publishedDocument?.publishRevision || 0}:${publishedDocument?.restartToken || 'local-default'}`,
+        reason: 'presentation-focused',
+        visibilityState,
+        isFocused,
+        heartbeatTtlMs: RUNTIME_SURFACE_HEARTBEAT_TTL_MS,
+      })
+
+      if (!startupHeartbeatPublishedRef.current) {
+        startupHeartbeatPublishedRef.current = true
+        setStartupFailOpenActive(false)
+      }
+    }
+
+    publishHeartbeat()
+    const timer = window.setInterval(publishHeartbeat, RUNTIME_SURFACE_HEARTBEAT_INTERVAL_MS)
+    window.addEventListener('focus', publishHeartbeat)
+    window.addEventListener('blur', publishHeartbeat)
+    document.addEventListener('visibilitychange', publishHeartbeat)
+
+    return () => {
+      window.clearInterval(timer)
+      window.removeEventListener('focus', publishHeartbeat)
+      window.removeEventListener('blur', publishHeartbeat)
+      document.removeEventListener('visibilitychange', publishHeartbeat)
+      releaseRuntimeSurfacePriorityHeartbeat({
+        surfaceType: 'presentation',
+        surfaceSessionId: presentationSurfaceSessionIdRef.current,
+      })
+    }
+  }, [publishedDocument?.publishRevision, publishedDocument?.restartToken])
 
   useEffect(() => {
     const refreshVerificationStatus = () => {
@@ -183,6 +293,51 @@ function PresentationPage() {
   const restartToken = publishedDocument?.restartToken || 'local-default'
   const shouldAutoRunTimeline = hasPublishedTimelinePayload || settings.presentation?.autoRunTimeline === true
   const timelineDurationSec = runtimeTimeline?.duration?.seconds || 180
+  const resolvedRuntimeSurfacePriority = useMemo(
+    () => resolveRuntimeSurfacePriorityState(runtimeSurfacePriorityState),
+    [runtimeSurfacePriorityState],
+  )
+  const presentationPauseReason = useMemo(() => {
+    if (startupFailOpenActive) {
+      return 'startup-fail-open'
+    }
+    if (
+      resolvedRuntimeSurfacePriority.resolvedSurfaceType === 'presentation'
+      && resolvedRuntimeSurfacePriority.resolvedReason === 'update-desktop-handoff'
+    ) {
+      return 'update-desktop-handoff'
+    }
+    if (!presentationDocumentVisible) {
+      return 'tab-hidden'
+    }
+    if (!presentationWindowFocused) {
+      return 'tab-unfocused'
+    }
+    if (resolvedRuntimeSurfacePriority.resolvedSurfaceType === 'studio') {
+      return 'studio-focused'
+    }
+    return 'presentation-focused'
+  }, [
+    presentationDocumentVisible,
+    presentationWindowFocused,
+    resolvedRuntimeSurfacePriority.resolvedReason,
+    resolvedRuntimeSurfacePriority.resolvedSurfaceType,
+    startupFailOpenActive,
+  ])
+  const presentationLoopPaused = !startupFailOpenActive && presentationPauseReason !== 'presentation-focused'
+
+  useEffect(() => {
+    startupHeartbeatPublishedRef.current = false
+    setStartupFailOpenActive(true)
+
+    const timer = window.setTimeout(() => {
+      setStartupFailOpenActive(false)
+    }, STARTUP_FAIL_OPEN_SETTLE_MS)
+
+    return () => {
+      window.clearTimeout(timer)
+    }
+  }, [])
 
   const handleResetTimeToZero = useCallback(() => {
     const nowMs = performance.now()
@@ -327,6 +482,7 @@ function PresentationPage() {
     const startEngine = () => {
       try {
         engine.start()
+        presentationLoopRunningRef.current = true
         devLog('engine-started', {
           runtimeSessionKey,
           sceneId: runtimeExecution.sceneId,
@@ -414,6 +570,7 @@ function PresentationPage() {
         window.clearTimeout(startTimer)
         engine.stop()
         engineRef.current = null
+        presentationLoopRunningRef.current = false
       }
     }
 
@@ -510,8 +667,29 @@ function PresentationPage() {
     return () => {
       engine.stop()
       engineRef.current = null
+      presentationLoopRunningRef.current = false
     }
   }, [background.src, basePreset, publishRevision, restartToken, runtimeExecution.sceneId, runtimeExecution.timelineId, runtimePayload, runtimeSessionKey, runtimeTimeline, settings.startupMode, settings.staticStartup?.holdSeconds, shouldAutoRunTimeline, timelineDurationSec])
+
+  useEffect(() => {
+    const engine = engineRef.current
+    if (!engine) {
+      return
+    }
+
+    if (presentationLoopPaused) {
+      if (presentationLoopRunningRef.current) {
+        engine.setLoopActive?.(false, `presentation-paused:${presentationPauseReason}`)
+        presentationLoopRunningRef.current = false
+      }
+      return
+    }
+
+    if (!presentationLoopRunningRef.current) {
+      engine.setLoopActive?.(true, `presentation-resumed:${presentationPauseReason}`)
+      presentationLoopRunningRef.current = true
+    }
+  }, [presentationLoopPaused, presentationPauseReason])
 
   useEffect(() => {
     if (!shouldAutoRunTimeline) {
@@ -680,11 +858,16 @@ function PresentationPage() {
       clockDebug,
       timing: presentationStats?.timing || {},
       bootstrap: presentationStats?.bootstrap || {},
+      runtimeSurfacePriority: resolvedRuntimeSurfacePriority,
+      activeSurface: resolvedRuntimeSurfacePriority.resolvedSurfaceType || null,
+      presentationPaused: presentationLoopPaused,
+      presentationPauseReason,
+      startupFailOpenActive,
     }
     return () => {
       delete window.__MISTYOS_PRESENTATION_RUNTIME
     }
-  }, [clockDebug, engineRef, fromSavedRevision, handleResetTimeToZero, handleSeekFirstRainWindow, presentationStats, publishRevision, restartToken, runtimePayloadHash, runtimeSessionKey])
+  }, [clockDebug, engineRef, fromSavedRevision, handleResetTimeToZero, handleSeekFirstRainWindow, presentationLoopPaused, presentationPauseReason, presentationStats, publishRevision, resolvedRuntimeSurfacePriority, restartToken, runtimePayloadHash, runtimeSessionKey, startupFailOpenActive])
 
   const fadeSeconds = settings.staticStartup?.fadeInSeconds ?? 2.2
   const launcherLabel = settings.presentation?.launcher?.label || 'MistyOS'
@@ -721,7 +904,6 @@ function PresentationPage() {
   const runtimeDurationSec = Number(
     presentationBootstrap?.simulationClockAuthority?.session?.durationSec || timelineDurationSec || 0,
   )
-
   return (
     <div className="presentation-shell">
       <BackgroundLayer background={background} />
@@ -764,14 +946,18 @@ function PresentationPage() {
             }}
           >
             <div>fps: {Number(presentationTiming.fps || presentationStats?.fps || 0).toFixed(1)}</div>
+            {/* Browser RAF is vsync-limited (~60Hz on 60Hz displays); lifecycle contention is about avoiding drops below cadence. */}
             <div>dt: {Number(presentationTiming.frameDeltaMs || 0).toFixed(2)}</div>
             <div>frame: {Number(presentationTiming.totalFrameTimeMs || presentationTiming.frameDeltaMs || 0).toFixed(2)}</div>
             <div>sim: {Number(presentationTiming.simulationTimeMs || 0).toFixed(2)}</div>
             <div>adapter: {Number(presentationTiming.adapterDrawTimeMs || 0).toFixed(2)}</div>
+            <div>adp s/r/d: {Number(presentationTiming.adapterSimulationTimeMs || 0).toFixed(2)}/{Number(presentationTiming.adapterGlStateResetTimeMs || 0).toFixed(2)}/{Number(presentationTiming.adapterRendererDrawTimeMs || 0).toFixed(2)}</div>
             <div>present: {Number(presentationTiming.presentationCompositeTimeMs || 0).toFixed(2)}</div>
             <div>rBack: {presentationTiming.rendererCanvasBackingSize || 'n/a'}</div>
             <div>rScale: {Number(presentationTiming.rendererCanvasCssScale || 1).toFixed(3)}</div>
             <div>rMount: {presentationTiming.rendererCanvasDomMountActive ? 'true' : 'false'}</div>
+            <div>activeSurface: {resolvedRuntimeSurfacePriority.resolvedSurfaceType || 'none'}</div>
+            <div>presentationPaused: {presentationLoopPaused ? 'true' : 'false'} ({presentationPauseReason})</div>
             <div>fps5sMin: {Number(presentationTiming.fpsRollingMin5s || 0).toFixed(1)}</div>
             <div>fps5sMax: {Number(presentationTiming.fpsRollingMax5s || 0).toFixed(1)}</div>
             <div>drop5sMin: {Math.round(presentationTiming.renderedSimulatorRaindropCountRollingMin5s || 0)}</div>

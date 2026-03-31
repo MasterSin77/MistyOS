@@ -12,3 +12,27 @@ tools/logs/
 # Disposable experiment outputs (workflow-hardening)
 artifacts/experiments/**
 !artifacts/experiments/.gitkeep
+
+# Pass 3 externalization boundaries
+artifacts/analysis/**
+artifacts/baseline-seed-screenshots/**
+artifacts/baseline-seed-screenshots-baseline/**
+artifacts/baseline-seed-screenshots-candidate-a/**
+artifacts/baseline-seed-screenshots-candidate-b/**
+artifacts/baseline-seed-screenshots-candidate-c/**
+artifacts/phase0/**
+artifacts/phase2/**
+artifacts/phase3/**
+artifacts/phase4/**
+artifacts/phase5/**
+artifacts/phase6/**
+artifacts/verification-real-path/**
+artifacts/*.png
+artifacts/*.json
+artifacts/*.log
+!artifacts/phase-validation-baseline-seed-run.json
+!artifacts/EXTERNALIZATION_PASS3_MOVE.json
+
+# Guard against accidental in-repo recreation of external archive
+MistyOS_artifacts_external/
+**/MistyOS_artifacts_external/

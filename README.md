@@ -1,235 +1,148 @@
-# MistyOS v1.0
+# MistyOS
 
-MistyOS is a WebGL-driven atmospheric surface simulation prototype that renders:
+MistyOS is a wet-surface weather runtime and authoring system with two coordinated browser surfaces:
 
-- raindrops
-- mist
-- fog
-- surface moisture behavior
+- Presentation: desktop or stage playback surface for runtime review.
+- Studio: authoring surface for timeline, scene, and runtime payload editing.
 
-The current system is derived from RaindropFX-style rendering techniques and extends them with a custom wetness/fog interaction layer.
+Current purpose: keep runtime behavior deterministic and handoff-safe while iterating toward GPU-authoritative wet-surface simulation.
 
-In v1.0, native RaindropFX remains the dominant droplet renderer/simulator, while MistyOS provides orchestration, wetness/fog interaction, compositing, tuning controls, and comparison tooling around that renderer. The baseline is intentionally hybrid rather than a fully unified moisture engine.
+## Current Product Model
 
-## Project Status
+MistyOS operates as a two-surface workflow:
 
-This repository represents the **MistyOS v1.0 baseline implementation**.
+1. Edit in Studio (`/studio`): adjust timeline, scene, and settings.
+2. Save: write an explicit saved authoring snapshot (`savedRevision`).
+3. Update Desktop: publish from saved state only (`publishRevision`, `restartToken`) and hand off runtime ownership to Presentation.
+4. Review in Presentation (`/`): runtime restarts from the published payload and runs as a consumer surface.
 
-This version is frozen as the reference implementation before work begins on the next-generation unified moisture simulation engine.
+Important behavior:
 
-Future development will evolve from this baseline.
+- Save does not publish.
+- Update Desktop is the publish and handoff action.
+- Presentation consumes published runtime payload and does not author it.
 
-## Visual Features
+## Current Architecture Summary
 
-Current behavior in the codebase includes:
+Core runtime model today:
 
-- Rain droplets rendered by the native RaindropFX renderer/simulator path.
-- Mist/fog layers that accumulate over time via a condensation model.
-- Droplet accumulation and merging behavior in the native raindrop simulation.
-- Streaking/runners produced by droplet motion, trail disturbance, and split/wake events.
-- Surface interaction via pointer writing/clearing that carves through fog/wetness.
-- Blending/compositing of background, raindrop output, and fog overlay with tint/fill controls.
+- Deterministic engine authority: scheduler-sampled weather and runtime payload drive replay behavior.
+- Presentation is a rendering and review surface, not an authoring surface.
+- Studio is the authoring surface and controls Save and Update Desktop lifecycle actions.
+- `runtimeMode: gpuFields` is the default runtime mode in tuning config and introduces independent moisture-field authority (`src/engine/GpuFieldsState.js`).
+- Single-active-surface lifecycle is enforced through runtime surface priority heartbeats and TTL-based resolution (`src/runtime/authoringRuntimeBridge.js`).
+- Save vs Update Desktop semantics are explicit: Save writes `savedDocument`; Update Desktop publishes `publishedDocument` from saved state and issues `update-desktop-handoff`.
+- Canonical Presentation window targeting uses a named window (`mistyos-presentation-window`) and reuse-first behavior before opening a new window.
 
-Visual goal: present a wet glass surface where condensation rebuilds continuously while droplets and finger interaction clear and reshape the same visible moisture field.
+No-copy presentation baseline details:
 
-Implementation note for v1.0: writing is currently modeled primarily as a clearing interaction on the shared visible fog/wetness field. It is not yet a full residue/displacement/barrier fluid simulation.
+- In `gpuFields` runtime mode, Presentation uses the renderer canvas directly as the presentation source.
+- Legacy composite-source copy behavior remains available for non-`gpuFields` runtime modes.
 
-## Rendering Architecture
+## Current Status And Milestones
 
-High-level runtime flow:
+Recent stabilization outcomes reflected in current code and docs:
 
-1. React mounts a full-screen `<canvas>` (`src/main.jsx`, `src/App.jsx`).
-2. `WetSurfaceEngine` owns the frame loop, simulation state, and draw orchestration (`src/engine/WetSurfaceEngine.js`).
-3. Native RaindropFX is loaded from `public/vendor/raindropfx-bundle.js` through `RaindropFxRendererAdapter` (`src/engine/RaindropFxRendererAdapter.js`).
-4. Surface wetness/fog state is maintained in a CPU field (`SurfaceWetnessField`) and converted into an alpha texture/canvas (`src/engine/SurfaceWetnessField.js`).
-5. Final compositing draws background/raindrops first, then overlays fog/wetness through CPU 2D or optional WebGL overlay paths.
+- No-copy presentation baseline path is active for `gpuFields` runtime mode.
+- Adapter timing instrumentation is split (`raindropFxUpdateTimeMs`, `adapterSimulationTimeMs`, `adapterGlStateResetTimeMs`, `adapterRendererDrawTimeMs`) to separate simulation and draw/reset costs.
+- Cross-tab contention was surfaced and handled through runtime-surface ownership controls and preview pause semantics.
+- Single-active-surface policy is implemented via heartbeats, TTL staleness resolution, and explicit release/handoff transitions.
+- Update Desktop performs explicit Studio to Presentation handoff (`update-desktop-handoff`) and Presentation honors this state during startup/priority resolution.
+- Presentation window reuse is canonicalized with named-window targeting (`mistyos-presentation-window`) before fallback open.
+- Repo context and payload reduction work is reflected in active authority docs and repository boundary guidance (see `ACTIVE_CONTEXT.md` and `REPO_BOUNDARY.md`).
 
-### Core pipeline stages
+## Performance Notes
 
-1. Frame timing and setup
-- `requestAnimationFrame` drives `animate()` in `WetSurfaceEngine`.
-- Delta time is clamped for stability.
+- Presentation is expected to run near browser VSync cadence on a 60 Hz path (around 60 FPS when the active surface is focused).
+- Recent regressions below cadence were traced primarily to lifecycle and cross-tab scheduling contention, not raw adapter cost alone.
+- Browser visibility and focus scheduling can reduce cadence for non-active surfaces by design.
 
-2. Wetness field update
-- `SurfaceWetnessField.beginFrame()` resets per-frame stats.
-- Condensation recovery/refill runs via `addCondensation()`.
-- Optional smoothing/diffusion runs via `smooth()` over dirty/full regions.
-- Field converts to `ImageData` alpha in `toImageData()` and updates the fog canvas.
+## Contributor Working Rules
 
-3. Raindrop renderer update
-- In phase `>= 2`, `RaindropFxRendererAdapter.update()` runs native simulator + renderer.
-- Snapshot droplets are normalized and fed back into wetness interaction coupling.
+Use these repo rules when making changes:
 
-4. Droplet-to-surface interaction
-- `updateDropletsFromRenderer()` maps renderer drops into fog-space.
-- Head clearing and trail disturbance are applied via `clearFogBlob()` and `disturbFogTrail()`.
-- Large-runner gating, slope plausibility, and downward-only rules are tunable.
+- Treat active authority docs as primary references: `ACTIVE_CONTEXT.md`, `PHASES.md`, `REPO_BOUNDARY.md`, `.github/copilot-instructions.md`, and active architecture/decision/metrics docs.
+- `artifacts/`, `archive/`, and archived docs are not normal coding surfaces.
+- Prefer small, single-purpose changes.
+- Preserve runtime baseline behavior while iterating.
+- Do not reintroduce legacy copy/composite assumptions into the `gpuFields` presentation path.
+- Do not broaden retrieval or editing scope beyond active surfaces unless explicitly required.
 
-5. Pointer writing interaction
-- Pointer events (`pointerdown/move/up`) in phase `>= 3` call `applyFingerWipe()`.
-- Writing stamps multiple overlapping clear blobs to mimic finger-pad contact.
-- This interaction is clearance-driven in v1.0, not a physically complete material displacement model.
+## Run And Development
 
-6. Compositing/presentation
-- Background source: frozen frame, RaindropFX canvas, or fallback image/gradient.
-- Surface overlay:
-	- Default CPU path: draw fog canvas with alpha + tint/fill in 2D.
-	- Optional GPU overlay path: WebGL fullscreen quad samples fog texture and composes tint/fill.
-	- Optional split/compare modes render CPU vs GPU or RAW vs COMPOSITE side-by-side.
-
-### WebGL, buffers, and passes
-
-WebGL is used in three places in the current implementation:
-
-- Native RaindropFX renderer (external bundle, authoritative droplet renderer).
-- GPU overlay compositor runtime (`useGpuOverlayPrototype` / `useGpuFogCompositing`).
-- GPU wetness simulation scaffold (`useGpuWetnessSimulation`) with `diffuse-v1` and optional `write-v1` interaction pass.
-
-Current GPU wetness scaffold details:
-
-- Uses textures + framebuffer ping/pong strategy.
-- Runs a fullscreen fragment shader diffusion approximation.
-- Optionally applies queued write events (blob/segment clear) in a dedicated write pass.
-- Supports parity diagnostics against CPU fog alpha stats.
-- Falls back to CPU labels/behavior if GPU runtime is unavailable.
-
-### Compatibility and runtime modes
-
-For validation and benchmarking, the engine exposes multiple runtime/debug paths that can be switched through tuning/debug controls and capture-script overrides: CPU compatibility mode, GPU simulation modes, CPU/GPU overlay comparison, and split compare views. These modes are used for parity/performance testing of the v1.0 baseline rather than as separate product architectures.
-
-## Major Systems
-
-- Render loop engine: `src/engine/WetSurfaceEngine.js`
-	- Owns lifecycle, resize, pointer input, update sequencing, compositing, and telemetry.
-
-- Native raindrop adapter: `src/engine/RaindropFxRendererAdapter.js`
-	- Loads RaindropFX script, initializes runtime options, updates simulator/render, and emits normalized droplet snapshots.
-
-- Wetness field simulation: `src/engine/SurfaceWetnessField.js`
-	- Maintains multi-grid wetness/trail/runner-memory data, dirty-region tracking, condensation recovery, diffusion, and image conversion.
-
-- Tuning/control schema: `src/tuning/tuningConfig.js`
-	- Defines default config, linked controls, UI schema, debug toggles, and compatibility modes.
-
-- UI/HUD + tuning panel: `src/App.jsx`
-	- Exposes phase switching, tuning controls, presets, A/B slots, favorites, parameter sweeps, and extensive runtime metrics.
-
-- Capture/test automation: `scripts/capture-phase0-baseline.mjs`, `scripts/capture-phase0-visuals.mjs`
-	- Headless Playwright captures baseline scenes, screenshots, and HUD-derived metrics into `artifacts/`.
-
-## File Structure
-
-Important files/directories:
-
-- `src/main.jsx`: React entry point.
-- `src/App.jsx`: App shell, HUD, tuning panel, shortcuts (`1/2/3`), and engine wiring.
-- `src/styles.css`: App/HUD/tuning panel styling.
-- `src/engine/WetSurfaceEngine.js`: Main simulation and render orchestration.
-- `src/engine/RaindropFxRendererAdapter.js`: Adapter to native RaindropFX bundle.
-- `src/engine/SurfaceWetnessField.js`: CPU wetness field and conversion pipeline.
-- `src/engine/RaindropSimulation.js`: In-repo droplet simulation module (present, not currently wired into the active runtime path).
-- `src/tuning/tuningConfig.js`: Defaults, schema, storage keys, and linked parameter logic.
-- `public/media/`: Background/media assets.
-- `public/vendor/`: Vendor bundles, including RaindropFX runtime.
-- `scripts/`: Baseline and visual capture automation.
-- `artifacts/phase0..phase6/`: Captured measurements and images from baseline/migration runs.
-- `docs/`: Baseline and per-phase progress logs.
-- `PHASES.md`: Phase board and GPU migration execution notes.
-
-## Running the Project
-
-### Prerequisites
+Prerequisites:
 
 - Node.js 18+
 - npm
-- Microsoft Edge (used by Playwright scripts via `channel: 'msedge'`)
 
-### Install
+Install:
 
 ```bash
 npm install
 ```
 
-### Run locally
+Run dev server:
 
 ```bash
 npm run dev
 ```
 
-Open the Vite URL (usually `http://127.0.0.1:5173`).
+Common local URL:
 
-Useful URL flags:
+- `http://127.0.0.1:5173`
 
-- `?rdfxDebug=1`: enable extended renderer debug/HUD telemetry.
-- `?rdfxOnly=1`: renderer-only debug behavior path.
-- `?rdfxNativeOnly=1`: disable adapter-driven mist/droplet procedural tuning for debug isolation.
+Routes:
 
-### Build
+- Presentation route: `/`
+- Studio route: `/studio`
+
+Build:
 
 ```bash
 npm run build
 ```
 
-### Preview build
+Preview build:
 
 ```bash
 npm run preview
 ```
 
-### Baseline/test capture commands
+## Validation And Workflow Notes
 
-- Baseline scenes + metrics + screenshots:
-	- `node scripts/capture-phase0-baseline.mjs`
-- Visual references only:
-	- `node scripts/capture-phase0-visuals.mjs`
+Quick sanity checks:
 
-Common PowerShell overrides:
+- Presentation sanity:
+  - Open `/` with `?rdfxDebug=1`.
+  - Confirm runtime is rendering and timing counters are live.
+  - Confirm Presentation acts as active surface when focused.
 
-- Custom output path:
-	- `$env:OUT_JSON='artifacts/phase0/my-run.json'; node scripts/capture-phase0-baseline.mjs`
-- Force GPU overlay:
-	- `$env:FORCE_GPU_OVERLAY='1'; node scripts/capture-phase0-baseline.mjs`
-- Force GPU fog compositing:
-	- `$env:FORCE_GPU_OVERLAY='1'; $env:FORCE_GPU_FOG_COMPOSITING='1'; node scripts/capture-phase0-baseline.mjs`
-- Force GPU wetness + interaction:
-	- `$env:FORCE_GPU_WETNESS_SIMULATION='1'; $env:FORCE_GPU_WRITING_INTERACTION='1'; node scripts/capture-phase0-baseline.mjs`
-- Force compatibility mode (`auto|cpu-compat|gpu-sim|gpu-interaction`):
-	- `$env:FORCE_COMPAT_MODE='gpu-interaction'; node scripts/capture-phase0-baseline.mjs`
+- Studio sanity:
+  - Open `/studio`.
+  - Make a change and verify unsaved state.
+  - Run Save and verify saved state/revision update.
+  - Run Update Desktop and verify publish revision/restart token update.
 
-## Known Limitations
+Update Desktop semantics:
 
-Current v1.0 constraints:
+- Save alone does not hand off ownership.
+- Update Desktop publishes from saved state, performs explicit ownership handoff to Presentation, and triggers Presentation-focused review flow.
 
-- Physical realism is stylized rather than physically rigorous.
-- Fluid behavior is simplified (heuristic clearing, trail deposition, diffusion), not a full fluid dynamics solver.
-- Raindrop rendering/simulation and wetness field are coupled but still partly separate systems.
-- GPU wetness path is a scaffold/prototype kernel (`diffuse-v1` + optional `write-v1`) designed for staged migration and parity checks.
-- High-write scenarios can trigger aggressive queue dropping/coalescing in GPU interaction mode.
-- Some parity/performance conclusions are based on headless capture runs and should be supplemented with interactive validation.
-- There is no fully unified moisture material model that simultaneously solves rain, mist, condensation, residue, and runoff as one physically coherent surface state.
+## Repository Structure Overview
 
-## Vision: MistyOS Next Generation
+High-level map:
 
-The long-term direction is a unified moisture simulation engine where rain, mist, condensation, droplets, and user interaction all operate on one shared simulated surface.
+- `src/`: active runtime, authoring, scheduler, and verification code.
+- `public/`: media and vendor assets.
+- `tests/`: test scenarios and baselines.
+- `tools/`: verification and analysis utilities.
+- `scripts/`: active capture and support scripts.
+- `docs/architecture/`, `docs/decisions/`, `docs/metrics/`: active technical references.
+- `artifacts/`: run outputs and reports (not primary coding surface).
+- `archive/`, `docs/archive/`, `docs/archive_external/`: historical or externalized material.
 
-Intended conceptual behavior:
+## Current Priorities
 
-- moisture accumulation across the full surface
-- droplets merging and exchanging mass
-- threshold-based runner formation and acceleration
-- persistent residue from writing on glass
-- cascading water behavior when local accumulation exceeds thresholds
-
-This section describes direction only. It is not implemented in v1.0.
-
-## Development Philosophy
-
-MistyOS evolves in phased iterations.
-
-The v1.0 baseline implementation remains available for:
-
-- visual comparison
-- performance comparison
-- regression testing
-
-Future phases progressively introduce a more physically coherent unified moisture surface simulation while preserving a stable baseline reference.
+- Continue RaindropFX behavior parity validation against baseline-seed flows.
+- Advance wetness-driven fog coupling without breaking deterministic lifecycle contracts.
+- Preserve performance while keeping authoritative-field architecture and single-active-surface behavior intact.

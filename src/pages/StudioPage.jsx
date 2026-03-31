@@ -30,13 +30,19 @@ import {
   exportActiveProjectDocument,
   getPublishedRuntimeDocument,
   getProjectRegistry,
+  getRuntimeSurfacePriorityState,
   getSavedAuthoringDocument,
+  handoffRuntimeSurfaceToPresentation,
   importProjectDocument,
+  publishRuntimeSurfacePriorityHeartbeat,
   publishSavedAuthoringDocument,
+  releaseRuntimeSurfacePriorityHeartbeat,
+  resolveRuntimeSurfacePriorityState,
   runtimePayloadFingerprint,
   saveSavedAuthoringDocument,
   subscribeProjectRegistry,
   subscribePublishedRuntimeDocument,
+  subscribeRuntimeSurfacePriorityState,
   subscribeSavedAuthoringDocument,
   switchActiveProject,
 } from '../runtime/authoringRuntimeBridge'
@@ -128,6 +134,9 @@ const COLLAPSED_TIMELINE_HEIGHT = 44
 const COLLAPSED_SIDE_PANEL_WIDTH = 126
 const PLAYBACK_TICK_MS = 1000 / 30
 const SHUTTLE_RATE = 3
+const RUNTIME_SURFACE_HEARTBEAT_INTERVAL_MS = 1500
+const RUNTIME_SURFACE_HEARTBEAT_TTL_MS = 5000
+const PRESENTATION_WINDOW_NAME = 'mistyos-presentation-window'
 const PLAYBACK_EPSILON = 0.0001
 const BASE_UI_FONT_PX = 16
 const UI_FONT_STEPS = [16, 18, 20, 22, 24]
@@ -508,6 +517,8 @@ function StudioPage() {
   })
   const previewMountCountRef = useRef(0)
   const previewUnmountCountRef = useRef(0)
+  const previewLoopRunningRef = useRef(false)
+  const studioSurfaceSessionIdRef = useRef(`studio-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
   const menuRegionRef = useRef(null)
   const menuTriggerRefs = useRef({})
   const menuCloseTimerRef = useRef(null)
@@ -583,6 +594,11 @@ function StudioPage() {
   const [transportMode, setTransportMode] = useState('stopped')
   const [loopPlayback, setLoopPlayback] = useState(true)
   const [previewStats, setPreviewStats] = useState({ fog: 0, droplets: 0, timing: {} })
+  const [studioDocumentVisible, setStudioDocumentVisible] = useState(() => document.visibilityState === 'visible')
+  const [studioWindowFocused, setStudioWindowFocused] = useState(() => document.hasFocus())
+  const [runtimeSurfacePriorityState, setRuntimeSurfacePriorityState] = useState(() => getRuntimeSurfacePriorityState())
+  const [updateDesktopHandoffPending, setUpdateDesktopHandoffPending] = useState(false)
+  const [desktopSwitchFallbackVisible, setDesktopSwitchFallbackVisible] = useState(false)
   const [previewRawViewportSize, setPreviewRawViewportSize] = useState({ width: 0, height: 0 })
   const [previewViewportSize, setPreviewViewportSize] = useState({ width: 0, height: 0 })
   const [previewDevicePixelRatio, setPreviewDevicePixelRatio] = useState(() => window.devicePixelRatio || 1)
@@ -636,6 +652,7 @@ function StudioPage() {
   const resizeWidthRef = useRef(typeof window === 'undefined' ? 1440 : window.innerWidth)
   const autoCollapsedPanelsRef = useRef({ left: false, right: false })
   const autoCompressedLeftWidthRef = useRef(null)
+  const presentationWindowRef = useRef(null)
 
   const [workspaceLayout, setWorkspaceLayout] = useState(() => {
     const persisted = getStudioSettings().studio?.workspaceLayout
@@ -1053,6 +1070,35 @@ function StudioPage() {
   )
   const previewRuntimePublishRevision = publishedDocument?.publishRevision || 0
   const previewRuntimeRestartToken = publishedDocument?.restartToken || 'local-default'
+  const resolvedRuntimeSurfacePriority = useMemo(
+    () => resolveRuntimeSurfacePriorityState(runtimeSurfacePriorityState),
+    [runtimeSurfacePriorityState],
+  )
+  const studioPreviewPauseReason = useMemo(() => {
+    if (!studioDocumentVisible) {
+      return 'tab-hidden'
+    }
+    if (!studioWindowFocused) {
+      return 'tab-unfocused'
+    }
+    if (resolvedRuntimeSurfacePriority.resolvedSurfaceType === 'presentation') {
+      if (
+        updateDesktopHandoffPending
+        || resolvedRuntimeSurfacePriority.resolvedReason === 'update-desktop-handoff'
+      ) {
+        return 'update-desktop-handoff'
+      }
+      return 'presentation-focused'
+    }
+    return 'studio-focused'
+  }, [
+    resolvedRuntimeSurfacePriority.resolvedReason,
+    resolvedRuntimeSurfacePriority.resolvedSurfaceType,
+    studioDocumentVisible,
+    studioWindowFocused,
+    updateDesktopHandoffPending,
+  ])
+  const studioPreviewPaused = studioPreviewPauseReason !== 'studio-focused'
   const hasUnsavedChanges = workingPayloadFingerprint !== savedPayloadFingerprint
   const publishIsOutdated = savedPayloadFingerprint !== publishedPayloadFingerprint
   const activeProjectId = projectRegistry.activeProjectId || null
@@ -1095,6 +1141,84 @@ function StudioPage() {
   const activeAuthoringRegion = selectedClip?.region || compositionRegionContext || 'global'
 
   const selectedTimelineKey = selectedTimeline?.id || activeTimelineId || 'timeline-fallback'
+
+  useEffect(() => {
+    const updateVisibilityAndFocus = () => {
+      setStudioDocumentVisible(document.visibilityState === 'visible')
+      setStudioWindowFocused(document.hasFocus())
+    }
+
+    updateVisibilityAndFocus()
+    window.addEventListener('focus', updateVisibilityAndFocus)
+    window.addEventListener('blur', updateVisibilityAndFocus)
+    document.addEventListener('visibilitychange', updateVisibilityAndFocus)
+
+    return () => {
+      window.removeEventListener('focus', updateVisibilityAndFocus)
+      window.removeEventListener('blur', updateVisibilityAndFocus)
+      document.removeEventListener('visibilitychange', updateVisibilityAndFocus)
+    }
+  }, [])
+
+  useEffect(() => subscribeRuntimeSurfacePriorityState(setRuntimeSurfacePriorityState), [])
+
+  useEffect(() => {
+    const publishOrReleaseStudioHeartbeat = () => {
+      const visible = document.visibilityState === 'visible'
+      const focused = document.hasFocus()
+
+      if (updateDesktopHandoffPending && !visible) {
+        setUpdateDesktopHandoffPending(false)
+      }
+
+      if (updateDesktopHandoffPending && visible && !focused) {
+        setUpdateDesktopHandoffPending(false)
+      }
+
+      if (updateDesktopHandoffPending && visible && focused) {
+        releaseRuntimeSurfacePriorityHeartbeat({
+          surfaceType: 'studio',
+          surfaceSessionId: studioSurfaceSessionIdRef.current,
+        })
+        return
+      }
+
+      if (visible && focused) {
+        publishRuntimeSurfacePriorityHeartbeat({
+          surfaceType: 'studio',
+          surfaceSessionId: studioSurfaceSessionIdRef.current,
+          surfaceWindowId: `${window.location.pathname || '/studio'}:${activeProjectId || 'no-project'}`,
+          reason: 'studio-focused',
+          visibilityState: 'visible',
+          isFocused: true,
+          heartbeatTtlMs: RUNTIME_SURFACE_HEARTBEAT_TTL_MS,
+        })
+        return
+      }
+
+      releaseRuntimeSurfacePriorityHeartbeat({
+        surfaceType: 'studio',
+        surfaceSessionId: studioSurfaceSessionIdRef.current,
+      })
+    }
+
+    publishOrReleaseStudioHeartbeat()
+    const timer = window.setInterval(publishOrReleaseStudioHeartbeat, RUNTIME_SURFACE_HEARTBEAT_INTERVAL_MS)
+    window.addEventListener('focus', publishOrReleaseStudioHeartbeat)
+    window.addEventListener('blur', publishOrReleaseStudioHeartbeat)
+    document.addEventListener('visibilitychange', publishOrReleaseStudioHeartbeat)
+
+    return () => {
+      window.clearInterval(timer)
+      window.removeEventListener('focus', publishOrReleaseStudioHeartbeat)
+      window.removeEventListener('blur', publishOrReleaseStudioHeartbeat)
+      document.removeEventListener('visibilitychange', publishOrReleaseStudioHeartbeat)
+      releaseRuntimeSurfacePriorityHeartbeat({
+        surfaceType: 'studio',
+        surfaceSessionId: studioSurfaceSessionIdRef.current,
+      })
+    }
+  }, [activeProjectId, updateDesktopHandoffPending])
 
   useEffect(() => {
     if (!selectedScene) {
@@ -1568,6 +1692,7 @@ function StudioPage() {
     }
 
     engine.start()
+    previewLoopRunningRef.current = true
 
     return () => {
       previewUnmountCountRef.current += 1
@@ -1587,8 +1712,29 @@ function StudioPage() {
 
       engine.stop()
       previewEngineRef.current = null
+      previewLoopRunningRef.current = false
     }
   }, [panelState.center, previewHostReady, previewRuntimeBasePreset, previewRuntimeScene])
+
+  useEffect(() => {
+    const engine = previewEngineRef.current
+    if (!engine) {
+      return
+    }
+
+    if (studioPreviewPaused) {
+      if (previewLoopRunningRef.current) {
+        engine.setLoopActive?.(false, `studio-preview-paused:${studioPreviewPauseReason}`)
+        previewLoopRunningRef.current = false
+      }
+      return
+    }
+
+    if (!previewLoopRunningRef.current) {
+      engine.setLoopActive?.(true, 'studio-preview-resumed')
+      previewLoopRunningRef.current = true
+    }
+  }, [studioPreviewPauseReason, studioPreviewPaused])
 
   useEffect(() => {
     if (process.env.NODE_ENV !== 'development') {
@@ -1599,13 +1745,28 @@ function StudioPage() {
     window.__MISTYOS_STUDIO_RUNTIME = {
       activeTimelineId,
       activeWorkspaceTab,
+      activeSurface: resolvedRuntimeSurfacePriority.resolvedSurfaceType || null,
+      currentSurfacePriority: resolvedRuntimeSurfacePriority.resolvedSurfaceType || null,
+      currentSurfacePriorityReason: resolvedRuntimeSurfacePriority.resolvedReason || null,
+      studioPreviewPaused,
+      studioPreviewPauseReason,
+      updateDesktopHandoffPending,
     }
 
     return () => {
       delete window.__MISTYOS_STUDIO_PREVIEW_STATS
       delete window.__MISTYOS_STUDIO_RUNTIME
     }
-  }, [activeTimelineId, activeWorkspaceTab, previewStats])
+  }, [
+    activeTimelineId,
+    activeWorkspaceTab,
+    previewStats,
+    resolvedRuntimeSurfacePriority.resolvedReason,
+    resolvedRuntimeSurfacePriority.resolvedSurfaceType,
+    studioPreviewPauseReason,
+    studioPreviewPaused,
+    updateDesktopHandoffPending,
+  ])
 
   useEffect(() => {
     const engine = previewEngineRef.current
@@ -1688,6 +1849,11 @@ function StudioPage() {
   useEffect(() => {
     playbackClockRef.current = performance.now()
     const timer = window.setInterval(() => {
+      if (studioPreviewPaused) {
+        playbackClockRef.current = performance.now()
+        return
+      }
+
       if (scrubActiveRef.current) {
         playbackClockRef.current = performance.now()
         return
@@ -1729,7 +1895,7 @@ function StudioPage() {
     }, PLAYBACK_TICK_MS)
 
     return () => window.clearInterval(timer)
-  }, [timelineDurationSec, loopPlayback])
+  }, [timelineDurationSec, loopPlayback, studioPreviewPaused])
 
   useEffect(() => {
     const nextLayout = normalizeWorkspaceLayout(settings.studio?.workspaceLayout)
@@ -2536,6 +2702,72 @@ function StudioPage() {
     URL.revokeObjectURL(url)
   }
 
+  const attemptSwitchToPresentationWindow = (source = 'update-desktop') => {
+    const presentationRoute = settings?.presentation?.launcher?.presentationRoute || '/'
+    let presentationUrl = '/'
+    try {
+      presentationUrl = new URL(presentationRoute, window.location.origin).toString()
+    } catch {
+      presentationUrl = `${window.location.origin}/`
+    }
+
+    let targetWindow = presentationWindowRef.current
+    const refLooksCanonical = Boolean(
+      targetWindow
+      && !targetWindow.closed
+      && targetWindow.name === PRESENTATION_WINDOW_NAME,
+    )
+    if (!refLooksCanonical) {
+      targetWindow = null
+      presentationWindowRef.current = null
+    }
+
+    const reusedExistingWindow = Boolean(targetWindow && !targetWindow.closed)
+    let openedOrReusedWindow = reusedExistingWindow
+
+    if (!reusedExistingWindow) {
+      try {
+        targetWindow = window.open(presentationUrl, PRESENTATION_WINDOW_NAME)
+      } catch {
+        targetWindow = null
+      }
+      openedOrReusedWindow = Boolean(targetWindow && !targetWindow.closed)
+      if (openedOrReusedWindow) {
+        try {
+          if (targetWindow.name !== PRESENTATION_WINDOW_NAME) {
+            targetWindow.name = PRESENTATION_WINDOW_NAME
+          }
+        } catch {
+          // Ignore; named targeting is already best-effort.
+        }
+        presentationWindowRef.current = targetWindow
+      }
+    }
+
+    if (targetWindow && !targetWindow.closed) {
+      try {
+        targetWindow.focus()
+      } catch {
+        // Ignore browser-level focus restrictions and rely on fallback affordance.
+      }
+    }
+
+    const browserBlockedOrIgnored = !(targetWindow && !targetWindow.closed)
+    const likelyForegrounded = Boolean(targetWindow && !targetWindow.closed && !document.hasFocus())
+    const fallbackNeeded = browserBlockedOrIgnored || !likelyForegrounded
+    setDesktopSwitchFallbackVisible(fallbackNeeded)
+
+    return {
+      source,
+      presentationUrl,
+      reusedExistingWindow,
+      openedOrReusedWindow,
+      browserBlockedOrIgnored,
+      likelyForegrounded,
+      fallbackNeeded,
+    }
+  }
+
   const handleSaveAuthoringState = useCallback(() => {
     const saved = saveSavedAuthoringDocument(workingRuntimePayload)
     setSavedDocument(saved)
@@ -2567,14 +2799,28 @@ function StudioPage() {
     const published = publishSavedAuthoringDocument(savedDocument)
     if (published) {
       setPublishedDocument(published)
+      handoffRuntimeSurfaceToPresentation({
+        sourceSurfaceWindowId: `${window.location.pathname || '/studio'}:${activeProjectId || 'no-project'}`,
+        reason: 'update-desktop-handoff',
+        heartbeatTtlMs: RUNTIME_SURFACE_HEARTBEAT_TTL_MS,
+      })
+      setUpdateDesktopHandoffPending(true)
+      const presentationWindowSwitch = attemptSwitchToPresentationWindow('update-desktop')
       devLog('publish-command', {
         publishRevision: published.publishRevision,
         fromSavedRevision: published.fromSavedRevision,
         restartToken: published.restartToken,
+        ownershipHandoff: 'studio->presentation',
+        presentationWindowSwitch,
       })
     }
     return published || null
-  }, [hasUnsavedChanges, publishedDocument?.publishRevision, savedDocument])
+  }, [
+    activeProjectId,
+    hasUnsavedChanges,
+    publishedDocument?.publishRevision,
+    savedDocument,
+  ])
 
   const saveStatusLabel = hasUnsavedChanges
     ? 'Unsaved edits'
@@ -4755,6 +5001,8 @@ function StudioPage() {
                     <div>restartToken: {previewRuntimeRestartToken}</div>
                     <div>timelineId: {previewRuntimeTimelineId}</div>
                     <div>runtimePayloadHash: {previewRuntimePayloadHash}</div>
+                    <div>activeSurface: {resolvedRuntimeSurfacePriority.resolvedSurfaceType || 'none'}</div>
+                    <div>studioPreviewPaused: {studioPreviewPaused ? 'true' : 'false'} ({studioPreviewPauseReason})</div>
                     <div>Visible box: {previewVisibleBox.width}x{previewVisibleBox.height}px</div>
                     <div>Padded fit box: {previewPaddedFitBox.width}x{previewPaddedFitBox.height}px (inset {PREVIEW_MATTE_INSET_PX}px)</div>
                     <div>Contain baseline: {previewContainBaselineScale.toFixed(3)}x</div>
@@ -5747,6 +5995,16 @@ function StudioPage() {
               <span className="studio-footer-chip is-warning">
                 Warning: {projectLoadWarning}
               </span>
+            ) : null}
+            {desktopSwitchFallbackVisible ? (
+              <button
+                type="button"
+                className="studio-footer-chip studio-footer-chip-button"
+                onClick={() => attemptSwitchToPresentationWindow('manual-fallback')}
+                title="Open or focus the Presentation window"
+              >
+                Desktop updated - click to switch
+              </button>
             ) : null}
           </div>
         </div>
