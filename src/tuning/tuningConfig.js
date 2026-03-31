@@ -93,6 +93,10 @@ export const DEFAULT_TUNING_CONFIG = {
     fogSoftness: 0.34,
     largeRunnerInfluence: 0.21,
   },
+  runtime: {
+    // Default to gpuFields for manual evaluation; set to 'legacy' as fallback control for A/B comparison.
+    runtimeMode: 'gpuFields',
+  },
 }
 
 export const STORAGE_KEYS = {

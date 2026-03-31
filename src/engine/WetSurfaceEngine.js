@@ -1,6 +1,7 @@
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value))
 import { RaindropFxRendererAdapter } from './RaindropFxRendererAdapter'
 import { SurfaceWetnessField } from './SurfaceWetnessField'
+import { GpuFieldsState } from './GpuFieldsState'
 import { createSchedulerRuntime } from '../scheduler/runtime'
 import { createFourQuadrantRegionModel } from '../scheduler/region-model'
 import { DEFAULT_TUNING_CONFIG, deepClone, getLinkedEffectiveConfig, mergeDeep } from '../tuning/tuningConfig'
@@ -66,7 +67,15 @@ const ENGINE_ALLOWED_RUNTIME_APPLY_BOUNDARIES = new Set([
  */
 
 export class WetSurfaceEngine {
-  constructor(canvas, { backgroundSrc, phase = 3, onStats, tuningConfig, resizeMode = 'window', viewportElement = null }) {
+  constructor(canvas, {
+    backgroundSrc,
+    phase = 3,
+    onStats,
+    tuningConfig,
+    resizeMode = 'window',
+    viewportElement = null,
+    presentationInternalRenderScale = 1,
+  }) {
     this.canvas = canvas
     this.ctx = canvas.getContext('2d')
     this.backgroundSrc = backgroundSrc
@@ -76,6 +85,9 @@ export class WetSurfaceEngine {
     this.resizeMode = resizeMode === 'element' ? 'element' : 'window'
     this.viewportElement = viewportElement
     this.resizeObserver = null
+    this.presentationInternalRenderScale = clamp(Number(presentationInternalRenderScale) || 1, 0.25, 1)
+    this.rendererInternalWidth = 1
+    this.rendererInternalHeight = 1
 
     this.backgroundImage = new Image()
     this.backgroundImage.decoding = 'async'
@@ -95,6 +107,11 @@ export class WetSurfaceEngine {
     this.firstTickLogged = false
     this.lastTime = performance.now()
     this.tuningConfig = mergeDeep(DEFAULT_TUNING_CONFIG, tuningConfig || {})
+    this.gpuFieldsDirectToScreenMounted = false
+    this.gpuFieldsDirectToScreenCanvas = null
+    this.gpuFieldsDirectToScreenOriginalStyle = ''
+    this.gpuFieldsOverlayLastSignature = ''
+    this.gpuFieldsOverlayHasContent = false
     this.tuningSignature = JSON.stringify(this.tuningConfig)
     this.fogLevel = this.tuningConfig.fogSurface.baseFogLevel
     this.lastAppliedFogScale = clamp(this.tuningConfig.fogSurface.fogScale, 0.2, 1)
@@ -106,6 +123,14 @@ export class WetSurfaceEngine {
       diffusionRate: this.tuningConfig.surfaceWetness.diffusionRate,
       trailRecoveryRate: this.tuningConfig.surfaceWetness.trailRecoveryRate,
       runnerMemoryRecoveryRate: this.tuningConfig.surfaceWetness.runnerMemoryRecoveryRate,
+    })
+    // Phase 1: GPU-authoritative moisture field for gpuFields runtime mode.
+    // Independent state container separate from legacy SurfaceWetnessField.
+    this.gpuFieldsState = new GpuFieldsState(1, 1, {
+      initialMoisture: this.tuningConfig.surfaceWetness.initialWetness,
+      maxMoisture: this.tuningConfig.surfaceWetness.maxWetness,
+      condensationGain: this.tuningConfig.surfaceWetness.refillRate,
+      recoveryRate: this.tuningConfig.surfaceWetness.recoveryRate,
     })
     this.droplets = []
     this.previousRendererDropState = new Map()
@@ -232,6 +257,39 @@ export class WetSurfaceEngine {
     this.backgroundFrozen = false
     this.timing = {
       avgFrameMs: 0,
+      frameDeltaMs: 0,
+      totalFrameTimeMs: 0,
+      simulationTimeMs: 0,
+      renderTimeMs: 0,
+      raindropFxUpdateTimeMs: 0,
+      adapterDrawTimeMs: 0,
+      surfaceCompositeTimeMs: 0,
+      surfaceCompositeTimeMsDetailed: {
+        fogCanvasBlitTimeMs: 0,
+        tintPassTimeMs: 0,
+        remainingSurfaceCompositeWorkTimeMs: 0,
+      },
+      presentationCompositeTimeMs: 0,
+      overlayCanvasDrawTimeMs: 0,
+      overlayCanvasDirect2dDrawTimeMs: 0,
+      debugOverlayCompositeTimeMs: 0,
+      rendererCanvasDomMountActive: false,
+      rendererCanvasCssScale: 1,
+      rendererCanvasClientSize: '0x0',
+      rendererCanvasBackingSize: '0x0',
+      overlayCanvasClientSize: '0x0',
+      overlayCanvasBackingSize: '0x0',
+      runtimeMode: 'legacy',
+      fps: 0,
+      fpsWindowMs: 0,
+      fpsWindowFrames: 0,
+      fpsRollingMin5s: 0,
+      fpsRollingMax5s: 0,
+      renderedSimulatorRaindropCountRollingMin5s: 0,
+      renderedSimulatorRaindropCountRollingMax5s: 0,
+      raindropFxUpdateTimeMsRollingMin5s: 0,
+      raindropFxUpdateTimeMsRollingMax5s: 0,
+      gpuFieldsRendererCanvasDomMountActive: false,
       engineMs: 0,
       rendererMs: 0,
       wetnessMs: 0,
@@ -337,12 +395,22 @@ export class WetSurfaceEngine {
       runtimeSteadyLiveApplyCount: 0,
       runtimeStartupAuthorityOwner: 'engine',
       runtimeStartupPhaseCurrent: ENGINE_SESSION_STARTUP_PHASES.CONSTRUCTED,
+      renderDisplayWidth: 0,
+      renderDisplayHeight: 0,
+      renderInternalScale: 1,
+      renderInternalWidth: 0,
+      renderInternalHeight: 0,
+      renderInternalResolutionLabel: '0x0',
+      gpuFieldsDisplayMoisture: 0,
+      gpuFieldsStats: null,
     }
     this.sceneAgeSec = 0
     this.wetnessFrameCounter = 0
     this.lastBaseWetnessSynced = this.fogLevel
     this.baseWetnessSyncThreshold = 0.0025
     this.wetnessTrendHistory = []
+    this.stabilityReadoutWindowMs = 5000
+    this.stabilityReadoutSamples = []
     this.lastWetnessTrendSampleSec = 0
     this.perfLogEnabled = query.get('wetPerfLog') === '1'
     this.lastFrameTimestamp = 0
@@ -2035,7 +2103,8 @@ export class WetSurfaceEngine {
     }
 
     this.integrationCounters.setTuningConfigCalls += 1
-    const merged = mergeDeep(DEFAULT_TUNING_CONFIG, nextConfig || {})
+    const nextSource = nextConfig && typeof nextConfig === 'object' ? nextConfig : {}
+    const merged = mergeDeep(DEFAULT_TUNING_CONFIG, nextSource)
     const signature = JSON.stringify(merged)
     const shouldApplyLiveSettings = signature !== this.tuningSignature
 
@@ -2092,6 +2161,15 @@ export class WetSurfaceEngine {
       wetnessFlowMemoryFactor: wetness.wetnessFlowMemoryFactor,
     })
 
+    // Phase 1: Apply tuning settings to GPU fields state independently
+    this.gpuFieldsState.options = {
+      initialMoisture: wetness.initialWetness,
+      maxMoisture: wetness.maxWetness,
+      condensationGain: wetness.refillRate,
+      recoveryRate: wetness.recoveryRate,
+      minMoisture: 0,
+    }
+
     if (this.raindropRenderer) {
       this.raindropRenderer.setTuningConfig(this.tuningConfig)
     }
@@ -2104,6 +2182,10 @@ export class WetSurfaceEngine {
     if (fogScaleChanged && this.width && this.height) {
       // Avoid full resize work unless fog resolution actually changed.
       this.resize()
+    }
+
+    if (this.width && this.height) {
+      this.syncGpuFieldsDirectToScreenPresentation(this.getRuntimeMode() === 'gpuFields')
     }
 
     this.recordWetnessLifecycleTrace('applyLiveSettings', {
@@ -2307,6 +2389,7 @@ export class WetSurfaceEngine {
     this.canvas.removeEventListener('pointerup', this.onPointerUp)
     this.canvas.removeEventListener('pointerleave', this.onPointerUp)
     this.canvas.removeEventListener('pointercancel', this.onPointerUp)
+    this.syncGpuFieldsDirectToScreenPresentation(false)
 
     if (this.raindropRenderer) {
       this.raindropRenderer.destroy()
@@ -2341,9 +2424,13 @@ export class WetSurfaceEngine {
       this.raindropRendererReady = false
     }
 
+    const { width: rendererWidth, height: rendererHeight } = this.resolveRendererInternalSize(this.width, this.height)
+    this.rendererInternalWidth = rendererWidth
+    this.rendererInternalHeight = rendererHeight
+
     const adapter = new RaindropFxRendererAdapter({
-      width: this.width || 1,
-      height: this.height || 1,
+      width: rendererWidth,
+      height: rendererHeight,
       background: this.backgroundSrc,
       tuningConfig: this.tuningConfig,
     })
@@ -2372,8 +2459,8 @@ export class WetSurfaceEngine {
       this.bootstrapInfo.rendererAttached = true
       this.raindropRendererReady = true
       await adapter.setBackground(this.backgroundSrc)
-      const scaleX = this.width / this.fogCanvas.width
-      const scaleY = this.height / this.fogCanvas.height
+      const scaleX = rendererWidth / Math.max(1, this.fogCanvas.width)
+      const scaleY = rendererHeight / Math.max(1, this.fogCanvas.height)
       adapter.setInputScale(scaleX, scaleY)
       adapter.setTuningConfig(this.tuningConfig)
       this.bootstrapInfo.adapterInitDropletsPerSeconds = adapter.debug?.proceduralDropletsPerSecond ?? this.tuningConfig?.renderer?.dropletsPerSeconds ?? 0
@@ -2414,6 +2501,16 @@ export class WetSurfaceEngine {
     this.width = width
     this.height = height
 
+    const rendererSize = this.resolveRendererInternalSize(width, height)
+    this.rendererInternalWidth = rendererSize.width
+    this.rendererInternalHeight = rendererSize.height
+    this.timing.renderDisplayWidth = width
+    this.timing.renderDisplayHeight = height
+    this.timing.renderInternalScale = rendererSize.scale
+    this.timing.renderInternalWidth = rendererSize.width
+    this.timing.renderInternalHeight = rendererSize.height
+    this.timing.renderInternalResolutionLabel = `${rendererSize.width}x${rendererSize.height}`
+
     this.canvas.width = Math.floor(width * dpr)
     this.canvas.height = Math.floor(height * dpr)
     this.canvas.style.width = `${width}px`
@@ -2429,6 +2526,8 @@ export class WetSurfaceEngine {
 
     this.fogCtx.setTransform(1, 0, 0, 1, 0, 0)
     this.surfaceWetnessField.resize(this.fogCanvas.width, this.fogCanvas.height)
+    // Phase 1: Resize GPU fields state in tandem with legacy field
+    this.gpuFieldsState.resize(this.fogCanvas.width, this.fogCanvas.height)
     this.fogImageData = this.fogCtx.createImageData(this.fogCanvas.width, this.fogCanvas.height)
     this.syncFogCanvasFromWetnessField()
     this.recordWetnessLifecycleTrace('resize-surface-reset', {
@@ -2445,10 +2544,13 @@ export class WetSurfaceEngine {
       this.backgroundFrozen = false
     }
 
-    this.raindropRenderer?.resize(this.width, this.height)
+    this.raindropRenderer?.resize(this.rendererInternalWidth, this.rendererInternalHeight)
+    this.syncGpuFieldsDirectToScreenPresentation(this.getRuntimeMode() === 'gpuFields')
+    this.gpuFieldsOverlayLastSignature = ''
+    this.gpuFieldsOverlayHasContent = false
     if (this.raindropRenderer) {
-      const scaleX = this.width / this.fogCanvas.width
-      const scaleY = this.height / this.fogCanvas.height
+      const scaleX = this.rendererInternalWidth / Math.max(1, this.fogCanvas.width)
+      const scaleY = this.rendererInternalHeight / Math.max(1, this.fogCanvas.height)
       this.raindropRenderer.setInputScale(scaleX, scaleY)
     }
 
@@ -2863,7 +2965,11 @@ export class WetSurfaceEngine {
   }
 
   clearFogAt(x, y, radius) {
-    this.surfaceWetnessField.clearArea(x, y, radius, 0.8)
+    const runtimeMode = this.getRuntimeMode()
+    const allowLegacyClears = runtimeMode === 'legacy' || this.tuningConfig.debug?.gpuFieldsAllowLegacyClearsForDiagnostics === true
+    if (allowLegacyClears) {
+      this.surfaceWetnessField.clearArea(x, y, radius, 0.8)
+    }
   }
 
   clearFogBlob(x, y, radius, strength = 1, source = 'generic') {
@@ -2875,7 +2981,11 @@ export class WetSurfaceEngine {
       strength,
       source,
     })
-    this.surfaceWetnessField.clearArea(x, y, radius, strength)
+    const runtimeMode = this.getRuntimeMode()
+    const allowLegacyClears = runtimeMode === 'legacy' || this.tuningConfig.debug?.gpuFieldsAllowLegacyClearsForDiagnostics === true
+    if (allowLegacyClears) {
+      this.surfaceWetnessField.clearArea(x, y, radius, strength)
+    }
   }
 
   disturbFogTrail(fromX, fromY, toX, toY, radius, strength, options, source = 'generic') {
@@ -2890,7 +3000,11 @@ export class WetSurfaceEngine {
       options,
       source,
     })
-    this.surfaceWetnessField.disturbTrail(fromX, fromY, toX, toY, radius, strength, options)
+    const runtimeMode = this.getRuntimeMode()
+    const allowLegacyTrailWrites = runtimeMode === 'legacy' || this.tuningConfig.debug?.gpuFieldsAllowLegacyTrailWritesForDiagnostics === true
+    if (allowLegacyTrailWrites) {
+      this.surfaceWetnessField.disturbTrail(fromX, fromY, toX, toY, radius, strength, options)
+    }
   }
 
   isGpuWritingInteractionEnabled() {
@@ -2913,6 +3027,70 @@ export class WetSurfaceEngine {
       return false
     }
     return Boolean(this.tuningConfig.debug?.useGpuWetnessSimulation)
+  }
+
+  getRuntimeMode() {
+    const mode = this.tuningConfig?.runtime?.runtimeMode
+    if (mode === 'legacy' || mode === 'gpuFields') {
+      return mode
+    }
+    return 'legacy'
+  }
+
+  updateWetnessViaGpuFields(dt, options = {}) {
+    // Phase 3: Direct upstream condensation authorship.
+    // 
+    // GpuFields moisture is now authored directly by gpuFields logic,
+    // NOT by copying from legacy displayGrid. This eliminates dependency on
+    // legacy output and establishes gpuFields as independent authority.
+    //
+    // Primary flow (Phase 3+):
+    // 1. gpuFieldsState.applyDirectCondensation() reads/writes moistureField directly
+    // 2. Optional local spatial input applied (future: droplet impact, channels, etc)
+    // 3. drawSurfaceGpuRuntime reads gpuFieldsState.moistureField for per-pixel fog modulation
+    //
+    // Legacy fallback (transition guard):
+    // - If PHASE_3_TRANSITION_USE_LEGACY_GRID is true, also populates from displayGrid
+    // - Marked for removal once gpuFields spatial structure is mature
+    // - Currently disabled; legacy grid authorship is no longer primary path
+    //
+    // Not yet implemented:
+    // - Per-pixel dropout/impact events
+    // - Flow advection
+    // - Disturbance/write-wipe coupling
+    // - Optical derivatives
+    
+    const PHASE_3_TRANSITION_USE_LEGACY_GRID = false // Set to true only for transition debugging
+    
+    this.gpuFieldsState.beginFrame()
+    
+    // Primary path: gpuFields authors its own moisture field directly.
+    // Pass optional local spatial input for per-pixel variation.
+    // For Phase 3 baseline, use null (uniform condensation + recovery).
+    const displayMoisture = this.gpuFieldsState.applyDirectCondensation(dt, null, 0.5)
+    
+    // TRANSITION GUARD (Phase 3 only): Optionally fallback to legacy displayGrid sampling.
+    // This allows comparing legacy vs gpuFields authorship during transition.
+    // Currently disabled and marked for removal once gpuFields behavior is validated.
+    if (PHASE_3_TRANSITION_USE_LEGACY_GRID) {
+      const legacySurfaces = this.surfaceWetnessField.getRenderSurfaces?.()
+      if (legacySurfaces && legacySurfaces.displayGrid) {
+        this.gpuFieldsState.transferFromLegacyGrid(
+          legacySurfaces.displayGrid,
+          legacySurfaces.baseWetness || 0,
+          this.tuningConfig.surfaceWetness.maxMoisture || 0.36,
+        )
+      }
+    }
+    
+    const allowLegacyCondensationDiagnostics = this.tuningConfig.debug?.gpuFieldsAllowLegacyCondensationForDiagnostics === true
+    if (allowLegacyCondensationDiagnostics) {
+      this.surfaceWetnessField.addCondensation(dt, options)
+    }
+    
+    // Diagnostic: track gpuFields moisture from independent authority
+    this.timing.gpuFieldsDisplayMoisture = displayMoisture
+    this.timing.gpuFieldsStats = this.gpuFieldsState.getStats()
   }
 
   getRequestedCompatibilityMode() {
@@ -3107,8 +3285,10 @@ export class WetSurfaceEngine {
       return performance.now() - started
     }
 
-    const toFogX = this.fogCanvas.width / Math.max(1, this.width)
-    const toFogY = this.fogCanvas.height / Math.max(1, this.height)
+    const rendererSurfaceWidth = Math.max(1, this.rendererInternalWidth || this.width)
+    const rendererSurfaceHeight = Math.max(1, this.rendererInternalHeight || this.height)
+    const toFogX = this.fogCanvas.width / rendererSurfaceWidth
+    const toFogY = this.fogCanvas.height / rendererSurfaceHeight
     const nextState = new Map()
     const motionEpsilon = 0.35
     const runnerCarveFrameStats = {
@@ -3126,6 +3306,10 @@ export class WetSurfaceEngine {
     }
     const currentFrameProbes = []
     const unmatchedPreviousState = new Map(this.previousRendererDropState)
+
+     // Phase 4: Collect droplet head clear events for gpuFields mode
+     const gpuClearEvents = []
+     const isGpuFieldsMode = this.getRuntimeMode() === 'gpuFields'
 
     for (let i = 0; i < rendererDrops.length; i += 1) {
       const drop = rendererDrops[i]
@@ -3200,6 +3384,27 @@ export class WetSurfaceEngine {
         })
         const beforeDepth = this.sampleRunnerCarveProbeDepth(segmentProbe)
 
+        if (isGpuFieldsMode) {
+          this.gpuFieldsState.applyTrailCarve(
+            previous.x,
+            previous.y,
+            fx,
+            fy,
+            segmentRadius,
+            segmentStrength,
+            {
+              trailMagnitude: 0.18,
+              runnerMagnitude: 0.32,
+              gridMagnitude: 0.05,
+              taperStart: 0.56,
+              taperEnd: 1.08,
+              accumulationClamp: 0.52,
+              runnerRadiusScale: 1.08,
+              gridRadiusScale: 0.76,
+            },
+          )
+        }
+
         this.disturbFogTrail(previous.x, previous.y, fx, fy, segmentRadius, segmentStrength, {
           trailMagnitude: 0.18,
           runnerMagnitude: 0.32,
@@ -3240,6 +3445,17 @@ export class WetSurfaceEngine {
               const t = s / (steps + 1)
               const ix = previous.x + cdx * t
               const iy = previous.y + cdy * t + gravityBiasDy * t
+              if (isGpuFieldsMode) {
+                this.gpuFieldsState.applyTrailCarve(
+                  ix,
+                  iy,
+                  ix,
+                  iy + gravityBiasDy,
+                  cadenceRadius,
+                  cadenceStrength,
+                  cadenceOptions,
+                )
+              }
               this.disturbFogTrail(
                 ix,
                 iy,
@@ -3288,6 +3504,10 @@ export class WetSurfaceEngine {
           mode: 'point',
         })
         const beforeDepth = this.sampleRunnerCarveProbeDepth(pointProbe)
+        // Phase 4: Collect clear event for gpuFields before legacy write
+        if (isGpuFieldsMode) {
+          gpuClearEvents.push({ cx: fx, cy: fy, radius: headClearRadius, strength: headStrength })
+        }
         this.clearFogBlob(fx, fy, headClearRadius, headStrength, 'droplet')
         const afterDepth = this.sampleRunnerCarveProbeDepth(pointProbe)
         runnerCarveFrameStats.sampleCount += 1
@@ -3309,6 +3529,13 @@ export class WetSurfaceEngine {
       }
 
       nextState.set(id, { x: fx, y: fy })
+    }
+
+    // Phase 4: Apply collected clear events to gpuFieldsState
+    if (isGpuFieldsMode && gpuClearEvents.length > 0) {
+      for (const event of gpuClearEvents) {
+        this.gpuFieldsState.applyLocalClear(event.cx, event.cy, event.radius, event.strength)
+      }
     }
 
     this.flushRunnerCarveDiagnostics(runnerCarveFrameStats)
@@ -3361,6 +3588,123 @@ export class WetSurfaceEngine {
     }
   }
 
+  drawRendererCanvasToPresentation(rendererCanvas, x, y, width, height) {
+    if (this.getRuntimeMode() === 'gpuFields') {
+      return
+    }
+
+    const drawStart = performance.now()
+    this.ctx.drawImage(rendererCanvas, x, y, width, height)
+    this.timing.adapterDrawTimeMs += performance.now() - drawStart
+  }
+
+  resetSurfaceCompositeTimingDetails() {
+    this.timing.surfaceCompositeTimeMsDetailed = {
+      fogCanvasBlitTimeMs: 0,
+      tintPassTimeMs: 0,
+      remainingSurfaceCompositeWorkTimeMs: 0,
+    }
+  }
+
+  addSurfaceCompositeTimingDetail(field, durationMs) {
+    if (!this.timing.surfaceCompositeTimeMsDetailed) {
+      this.resetSurfaceCompositeTimingDetails()
+    }
+    this.timing.surfaceCompositeTimeMsDetailed[field] += durationMs
+  }
+
+  getPresentationRendererCanvas(runtimeMode = this.getRuntimeMode()) {
+    if (!this.raindropRendererReady) {
+      return null
+    }
+
+    if (runtimeMode === 'gpuFields') {
+      return this.raindropRenderer?.canvas || null
+    }
+
+    const rendererCompositeSource = this.raindropRenderer?.getCompositeSourceCanvas?.() ?? null
+    return rendererCompositeSource?.canvas || this.raindropRenderer?.canvas || null
+  }
+
+  syncGpuFieldsDirectToScreenPresentation(active) {
+    const rendererCanvas = this.raindropRenderer?.canvas || null
+    const host = this.canvas?.parentElement || null
+
+    if (this.canvas) {
+      this.canvas.style.display = ''
+    }
+
+    if (active && rendererCanvas && host) {
+      if (this.gpuFieldsDirectToScreenCanvas !== rendererCanvas) {
+        this.gpuFieldsDirectToScreenOriginalStyle = rendererCanvas.style.cssText || ''
+        this.gpuFieldsDirectToScreenCanvas = rendererCanvas
+      }
+      if (rendererCanvas.parentElement !== host) {
+        host.insertBefore(rendererCanvas, this.canvas)
+      }
+      if (rendererCanvas.style.position !== 'absolute') rendererCanvas.style.position = 'absolute'
+      if (rendererCanvas.style.left !== '0px') rendererCanvas.style.left = '0'
+      if (rendererCanvas.style.top !== '0px') rendererCanvas.style.top = '0'
+      if (rendererCanvas.style.width !== '100%') rendererCanvas.style.width = '100%'
+      if (rendererCanvas.style.height !== '100%') rendererCanvas.style.height = '100%'
+      if (rendererCanvas.style.pointerEvents !== 'none') rendererCanvas.style.pointerEvents = 'none'
+      if (rendererCanvas.style.display !== 'block') rendererCanvas.style.display = 'block'
+      if (rendererCanvas.style.opacity !== '1') rendererCanvas.style.opacity = '1'
+      if (rendererCanvas.style.zIndex !== '1') rendererCanvas.style.zIndex = '1'
+      this.gpuFieldsDirectToScreenMounted = true
+      return
+    }
+
+    if (this.gpuFieldsDirectToScreenCanvas) {
+      this.gpuFieldsDirectToScreenCanvas.style.cssText = this.gpuFieldsDirectToScreenOriginalStyle
+      if (this.gpuFieldsDirectToScreenCanvas.parentElement) {
+        this.gpuFieldsDirectToScreenCanvas.remove()
+      }
+    }
+
+    this.gpuFieldsDirectToScreenMounted = false
+    this.gpuFieldsDirectToScreenCanvas = null
+    this.gpuFieldsDirectToScreenOriginalStyle = ''
+    this.gpuFieldsOverlayLastSignature = ''
+    this.gpuFieldsOverlayHasContent = false
+  }
+
+  buildGpuFieldsOverlaySignature({ viewMode }) {
+    return JSON.stringify({
+      width: this.width,
+      height: this.height,
+      rendererOnlyDebug: Boolean(this.rendererOnlyDebug),
+      rendererDebugEnabled: Boolean(this.rendererDebugEnabled),
+      showRawRendererInset: Boolean(this.tuningConfig.debug.showRawRendererInset),
+      viewMode,
+      compositeOverlayStrength: Number(this.tuningConfig.debug.compositeOverlayStrength ?? 1),
+      fogTintStrength: Number(this.tuningConfig.fogSurface.fogTintStrength ?? 0),
+      fogFillBoost: Number(this.tuningConfig.fogSurface.fogFillBoost ?? 0),
+    })
+  }
+
+  updateGpuFieldsPresentationTiming(runtimeMode = this.getRuntimeMode()) {
+    const rendererCanvas = this.raindropRenderer?.canvas || null
+    const overlayCanvas = this.canvas || null
+    const rendererClientWidth = Number(rendererCanvas?.clientWidth || 0)
+    const rendererClientHeight = Number(rendererCanvas?.clientHeight || 0)
+    const rendererBackingWidth = Number(rendererCanvas?.width || 0)
+    const rendererBackingHeight = Number(rendererCanvas?.height || 0)
+    const overlayClientWidth = Number(overlayCanvas?.clientWidth || 0)
+    const overlayClientHeight = Number(overlayCanvas?.clientHeight || 0)
+    const overlayBackingWidth = Number(overlayCanvas?.width || 0)
+    const overlayBackingHeight = Number(overlayCanvas?.height || 0)
+    const scaleX = rendererBackingWidth > 0 ? rendererClientWidth / rendererBackingWidth : 1
+    const scaleY = rendererBackingHeight > 0 ? rendererClientHeight / rendererBackingHeight : 1
+
+    this.timing.rendererCanvasDomMountActive = runtimeMode === 'gpuFields' && this.gpuFieldsDirectToScreenMounted
+    this.timing.rendererCanvasCssScale = Math.max(scaleX, scaleY)
+    this.timing.rendererCanvasClientSize = `${rendererClientWidth}x${rendererClientHeight}`
+    this.timing.rendererCanvasBackingSize = `${rendererBackingWidth}x${rendererBackingHeight}`
+    this.timing.overlayCanvasClientSize = `${overlayClientWidth}x${overlayClientHeight}`
+    this.timing.overlayCanvasBackingSize = `${overlayBackingWidth}x${overlayBackingHeight}`
+  }
+
   drawBackground({ includeRenderer = true } = {}) {
     this.renderCompositeDebug.backgroundDrawExecuted = true
     if (this.tuningConfig.debug.freezeBackground && this.backgroundFrozen) {
@@ -3390,20 +3734,29 @@ export class WetSurfaceEngine {
       }
     }
 
-    const rendererCompositeSource = this.raindropRenderer?.getCompositeSourceCanvas?.() ?? null
-    const rendererCanvas = rendererCompositeSource?.canvas || this.raindropRenderer?.canvas || null
+    const rendererCanvas = this.getPresentationRendererCanvas()
 
     if (includeRenderer && this.raindropRendererReady && rendererCanvas) {
       this.renderCompositeDebug.rawRendererCanvasDrawExecuted = true
       // Keep a guaranteed scene underlay so transient renderer canvas coverage gaps
       // never expose a black clear region after save/publish remounts.
-      this.ctx.drawImage(rendererCanvas, 0, 0, this.width, this.height)
+      this.drawRendererCanvasToPresentation(rendererCanvas, 0, 0, this.width, this.height)
     }
   }
 
   drawSurface() {
+    const runtimeMode = this.getRuntimeMode()
     const shouldUseGpuOverlayPrototype = Boolean(this.tuningConfig.debug?.useGpuOverlayPrototype)
-    const renderedByGpu = shouldUseGpuOverlayPrototype && this.drawSurfaceGpuRuntime()
+    let renderedByGpu = false
+    if (shouldUseGpuOverlayPrototype) {
+      if (runtimeMode === 'gpuFields') {
+        const renderStart = performance.now()
+        renderedByGpu = this.drawSurfaceGpuRuntime()
+        this.timing.renderTimeMs += performance.now() - renderStart
+      } else {
+        renderedByGpu = this.drawSurfaceGpuRuntime()
+      }
+    }
     if (renderedByGpu) {
       this.timing.overlayBackend = this.tuningConfig.debug?.useGpuFogCompositing
         ? 'gpu-fog-composite'
@@ -3411,8 +3764,54 @@ export class WetSurfaceEngine {
       return
     }
 
+    // In gpuFields mode, fogCanvas is not synced from gpuFieldsState (sync is gated by
+    // allowLegacyFogCanvasSyncForDiagnostics). Drawing stale fogCanvas is a redundant
+    // full-frame canvas-to-canvas blit; use the direct tint path instead.
+    if (runtimeMode === 'gpuFields') {
+      this.timing.overlayBackend = 'cpu-2d'
+      this.drawSurfaceGpuFieldsDirect()
+      return
+    }
+
     this.timing.overlayBackend = 'cpu-2d'
     this.drawSurfaceCpu()
+  }
+
+  drawSurfaceGpuFieldsDirect() {
+    const overlayAlpha = clamp(this.tuningConfig.debug.compositeOverlayStrength ?? 1, 0, 1)
+    if (overlayAlpha <= 0) {
+      return
+    }
+
+    const setupStart = performance.now()
+    const tintStrength = clamp(this.tuningConfig.fogSurface.fogTintStrength, 0, 0.5)
+    const fillBoost = clamp(this.tuningConfig.fogSurface.fogFillBoost, 0, 0.08)
+    const fogTint = this.ctx.createLinearGradient(0, 0, this.width, this.height)
+    fogTint.addColorStop(0, `rgba(194, 215, 240, ${tintStrength * 1.08})`)
+    fogTint.addColorStop(1, `rgba(136, 166, 200, ${tintStrength * 0.82})`)
+    this.addSurfaceCompositeTimingDetail('remainingSurfaceCompositeWorkTimeMs', performance.now() - setupStart)
+
+    const tintPassStart = performance.now()
+    this.ctx.save()
+    this.ctx.globalAlpha = overlayAlpha
+    this.ctx.globalCompositeOperation = 'source-over'
+    this.ctx.fillStyle = fogTint
+    this.ctx.fillRect(0, 0, this.width, this.height)
+    this.ctx.globalCompositeOperation = 'source-over'
+    this.ctx.fillStyle = `rgba(236, 245, 255, ${fillBoost})`
+    this.ctx.fillRect(0, 0, this.width, this.height)
+    this.ctx.restore()
+    this.addSurfaceCompositeTimingDetail('tintPassTimeMs', performance.now() - tintPassStart)
+    this.timing.gpuOverlayPresentTarget = '2d-cpu'
+    this.timing.gpuOverlayPresentFramebuffer = 'n/a'
+    this.timing.gpuOverlayPresentSamples = 'gpufields-direct-screen-tint'
+    this.timing.gpuOverlayPresentSceneSource = 'raindropRenderer.canvas-dom'
+    this.timing.gpuOverlayPresentClearRgba = '2d-clearRect'
+    this.timing.gpuOverlayPresentBlendEnabled = 'n/a'
+    this.timing.gpuOverlayPresentBlendMode = 'n/a'
+    this.timing.gpuOverlayPresentAlphaConvention = 'n/a'
+    this.timing.gpuOverlayPresentContextAlpha = 'n/a'
+    this.timing.gpuOverlayPresentContextPremultiplied = 'n/a'
   }
 
   drawSurfaceCpu() {
@@ -3424,6 +3823,7 @@ export class WetSurfaceEngine {
     this.timing.rendererSamplingSource = 'fog-canvas-alpha-compat'
 
     // Surface overlay values used to be static constants; now driven by tuning state.
+    const setupStart = performance.now()
     const tintStrength = clamp(this.tuningConfig.fogSurface.fogTintStrength, 0, 0.5)
     const fillBoost = clamp(this.tuningConfig.fogSurface.fogFillBoost, 0, 0.08)
     const fogTint = this.ctx.createLinearGradient(0, 0, this.width, this.height)
@@ -3431,11 +3831,16 @@ export class WetSurfaceEngine {
     fogTint.addColorStop(1, `rgba(136, 166, 200, ${tintStrength * 0.82})`)
 
     const fogAlpha = clamp(this.tuningConfig.fogSurface.fogAlphaMultiplier, 0, 1.2)
+    this.addSurfaceCompositeTimingDetail('remainingSurfaceCompositeWorkTimeMs', performance.now() - setupStart)
+
+    const fogCanvasBlitStart = performance.now()
     this.ctx.save()
     this.ctx.globalAlpha = fogAlpha * overlayAlpha
     this.ctx.drawImage(this.fogCanvas, 0, 0, this.width, this.height)
     this.ctx.restore()
+    this.addSurfaceCompositeTimingDetail('fogCanvasBlitTimeMs', performance.now() - fogCanvasBlitStart)
 
+    const tintPassStart = performance.now()
     this.ctx.save()
     this.ctx.globalAlpha = overlayAlpha
     this.ctx.globalCompositeOperation = 'source-atop'
@@ -3447,6 +3852,7 @@ export class WetSurfaceEngine {
     this.ctx.fillStyle = `rgba(236, 245, 255, ${fillBoost})`
     this.ctx.fillRect(0, 0, this.width, this.height)
     this.ctx.restore()
+    this.addSurfaceCompositeTimingDetail('tintPassTimeMs', performance.now() - tintPassStart)
 
     this.timing.gpuOverlayPresentTarget = '2d-cpu'
     this.timing.gpuOverlayPresentFramebuffer = 'n/a'
@@ -3514,8 +3920,11 @@ export class WetSurfaceEngine {
         uniform sampler2D u_trailTex;
         uniform sampler2D u_runnerTex;
         uniform vec2 u_texel;
+        uniform vec2 u_gpuFieldsTexel;
         uniform float u_alpha;
         uniform float u_baseWetness;
+        uniform float u_gpuMoistureMax;
+        uniform float u_useGpuFieldsLocalDensity;
         uniform float u_fogDensityScale;
         uniform float u_softnessScale;
         uniform float u_mistTrailScale;
@@ -3543,40 +3952,101 @@ export class WetSurfaceEngine {
           return v * mix(vec3(1.0), clamp(p - 1.0, 0.0, 1.0), s);
         }
 
-        void main() {
-          // Texture uploads use UNPACK_FLIP_Y_WEBGL=true, so v_uv is sampled directly.
-          float wetCenter = clamp(texture2D(u_wetnessTex, v_uv).r, 0.0, 1.0);
-          float wetLeft = clamp(texture2D(u_wetnessTex, vec2(v_uv.x - u_texel.x, v_uv.y)).r, 0.0, 1.0);
-          float wetRight = clamp(texture2D(u_wetnessTex, vec2(v_uv.x + u_texel.x, v_uv.y)).r, 0.0, 1.0);
-          float wetUp = clamp(texture2D(u_wetnessTex, vec2(v_uv.x, v_uv.y - u_texel.y)).r, 0.0, 1.0);
-          float wetDown = clamp(texture2D(u_wetnessTex, vec2(v_uv.x, v_uv.y + u_texel.y)).r, 0.0, 1.0);
-          float wetUL = clamp(texture2D(u_wetnessTex, vec2(v_uv.x - u_texel.x, v_uv.y - u_texel.y)).r, 0.0, 1.0);
-          float wetUR = clamp(texture2D(u_wetnessTex, vec2(v_uv.x + u_texel.x, v_uv.y - u_texel.y)).r, 0.0, 1.0);
-          float wetDL = clamp(texture2D(u_wetnessTex, vec2(v_uv.x - u_texel.x, v_uv.y + u_texel.y)).r, 0.0, 1.0);
-          float wetDR = clamp(texture2D(u_wetnessTex, vec2(v_uv.x + u_texel.x, v_uv.y + u_texel.y)).r, 0.0, 1.0);
-
-          float trail = clamp(texture2D(u_trailTex, v_uv).r, 0.0, 1.0);
-          float runner = clamp(texture2D(u_runnerTex, v_uv).r, 0.0, 1.0);
-
-          float localWetness = clamp(
-            wetCenter * 0.40 +
-            (wetLeft + wetRight + wetUp + wetDown) * 0.10 +
-            (wetUL + wetUR + wetDL + wetDR) * 0.05,
-            0.0,
-            1.0
+        float sampleGpuFieldsWetness(vec2 uv) {
+          float gpuWetnessFloor = 0.06;
+          float gpuWetnessCeiling = 0.84;
+          float moistureNorm = clamp(texture2D(u_wetnessTex, uv).r / max(0.0001, u_gpuMoistureMax), 0.0, 1.0);
+          float shaped = pow(moistureNorm, 0.65);
+          float contrastBoost = clamp(shaped + shaped * (1.0 - shaped) * 0.62, 0.0, 1.0);
+          float channelClearEmphasis = clamp(contrastBoost - (1.0 - contrastBoost) * (1.0 - contrastBoost) * 0.12, 0.0, 1.0);
+          float mappedWetness = clamp(
+            gpuWetnessFloor + channelClearEmphasis * (gpuWetnessCeiling - gpuWetnessFloor),
+            gpuWetnessFloor,
+            gpuWetnessCeiling
           );
 
-          float gradX = wetRight - wetLeft;
-          float gradY = wetDown - wetUp;
-          float gradMag = clamp(length(vec2(gradX, gradY)) * 3.8, 0.0, 1.0);
-          float softness = clamp((1.0 - gradMag) * (0.42 + localWetness * 0.58), 0.0, 1.0);
+          float leftNorm = clamp(texture2D(u_wetnessTex, uv - vec2(u_gpuFieldsTexel.x, 0.0)).r / max(0.0001, u_gpuMoistureMax), 0.0, 1.0);
+          float rightNorm = clamp(texture2D(u_wetnessTex, uv + vec2(u_gpuFieldsTexel.x, 0.0)).r / max(0.0001, u_gpuMoistureMax), 0.0, 1.0);
+          float upNorm = clamp(texture2D(u_wetnessTex, uv - vec2(0.0, u_gpuFieldsTexel.y)).r / max(0.0001, u_gpuMoistureMax), 0.0, 1.0);
+          float downNorm = clamp(texture2D(u_wetnessTex, uv + vec2(0.0, u_gpuFieldsTexel.y)).r / max(0.0001, u_gpuMoistureMax), 0.0, 1.0);
+          float edgeCue = clamp((abs(rightNorm - leftNorm) + abs(downNorm - upNorm)) * 0.5, 0.0, 1.0);
+          float edgeClear = edgeCue * edgeCue * 0.08;
+
+          return clamp(
+            mappedWetness - (1.0 - mappedWetness) * edgeClear,
+            gpuWetnessFloor,
+            gpuWetnessCeiling
+          );
+        }
+
+        void main() {
+          // Texture uploads use UNPACK_FLIP_Y_WEBGL=true, so v_uv is sampled directly.
+          float wetCenter;
+          float wetLeft;
+          float wetRight;
+          float wetUp;
+          float wetDown;
+          float wetUL;
+          float wetUR;
+          float wetDL;
+          float wetDR;
+          float trail;
+          float runner;
+          float localWetness;
+          float softness;
+          float impactClear;
+
+          if (u_useGpuFieldsLocalDensity > 0.5) {
+            wetCenter = sampleGpuFieldsWetness(v_uv);
+            wetLeft = sampleGpuFieldsWetness(v_uv - vec2(u_gpuFieldsTexel.x, 0.0));
+            wetRight = sampleGpuFieldsWetness(v_uv + vec2(u_gpuFieldsTexel.x, 0.0));
+            wetUp = sampleGpuFieldsWetness(v_uv - vec2(0.0, u_gpuFieldsTexel.y));
+            wetDown = sampleGpuFieldsWetness(v_uv + vec2(0.0, u_gpuFieldsTexel.y));
+            wetUL = sampleGpuFieldsWetness(v_uv - u_gpuFieldsTexel);
+            wetUR = sampleGpuFieldsWetness(v_uv + vec2(u_gpuFieldsTexel.x, -u_gpuFieldsTexel.y));
+            wetDL = sampleGpuFieldsWetness(v_uv + vec2(-u_gpuFieldsTexel.x, u_gpuFieldsTexel.y));
+            wetDR = sampleGpuFieldsWetness(v_uv + u_gpuFieldsTexel);
+            trail = 0.0;
+            runner = 0.0;
+            localWetness = wetCenter;
+            softness = wetCenter;
+            impactClear = clamp(max(0.0, u_baseWetness - wetCenter) * 1.65, 0.0, 0.58);
+          } else {
+            wetCenter = clamp(texture2D(u_wetnessTex, v_uv).r, 0.0, 1.0);
+            wetLeft = clamp(texture2D(u_wetnessTex, vec2(v_uv.x - u_texel.x, v_uv.y)).r, 0.0, 1.0);
+            wetRight = clamp(texture2D(u_wetnessTex, vec2(v_uv.x + u_texel.x, v_uv.y)).r, 0.0, 1.0);
+            wetUp = clamp(texture2D(u_wetnessTex, vec2(v_uv.x, v_uv.y - u_texel.y)).r, 0.0, 1.0);
+            wetDown = clamp(texture2D(u_wetnessTex, vec2(v_uv.x, v_uv.y + u_texel.y)).r, 0.0, 1.0);
+            wetUL = clamp(texture2D(u_wetnessTex, vec2(v_uv.x - u_texel.x, v_uv.y - u_texel.y)).r, 0.0, 1.0);
+            wetUR = clamp(texture2D(u_wetnessTex, vec2(v_uv.x + u_texel.x, v_uv.y - u_texel.y)).r, 0.0, 1.0);
+            wetDL = clamp(texture2D(u_wetnessTex, vec2(v_uv.x - u_texel.x, v_uv.y + u_texel.y)).r, 0.0, 1.0);
+            wetDR = clamp(texture2D(u_wetnessTex, vec2(v_uv.x + u_texel.x, v_uv.y + u_texel.y)).r, 0.0, 1.0);
+            trail = clamp(texture2D(u_trailTex, v_uv).r, 0.0, 1.0);
+            runner = clamp(texture2D(u_runnerTex, v_uv).r, 0.0, 1.0);
+
+            localWetness = clamp(
+              wetCenter * 0.40 +
+              (wetLeft + wetRight + wetUp + wetDown) * 0.10 +
+              (wetUL + wetUR + wetDL + wetDR) * 0.05,
+              0.0,
+              1.0
+            );
+
+            float gradX = wetRight - wetLeft;
+            float gradY = wetDown - wetUp;
+            float gradMag = clamp(length(vec2(gradX, gradY)) * 3.8, 0.0, 1.0);
+            softness = clamp((1.0 - gradMag) * (0.42 + localWetness * 0.58), 0.0, 1.0);
+            impactClear = clamp(max(0.0, u_baseWetness - wetCenter) * 1.65, 0.0, 0.58);
+          }
 
           float contrast = max(0.1, u_debugContrast);
           float wetViz = clamp(pow(wetCenter, 1.0 / contrast), 0.0, 1.0);
           float trailViz = clamp(pow(trail, 1.0 / contrast), 0.0, 1.0);
           float runnerViz = clamp(pow(runner, 1.0 / contrast), 0.0, 1.0);
 
-          float wetField = clamp(mix(u_baseWetness, wetCenter, 0.84), 0.0, 1.0);
+          float wetField = u_useGpuFieldsLocalDensity > 0.5
+            ? wetCenter
+            : clamp(mix(u_baseWetness, wetCenter, 0.84), 0.0, 1.0);
           float fogBaseDensity = clamp(
             wetField * (0.58 + u_fogDensityScale * 0.22) +
             softness * u_softnessScale * 0.16 +
@@ -3584,7 +4054,6 @@ export class WetSurfaceEngine {
             0.0,
             1.0
           );
-          float impactClear = clamp(max(0.0, u_baseWetness - wetCenter) * 1.65, 0.0, 0.58);
           float mistSweep = clamp(trail * (0.18 + u_mistTrailScale * 0.10) + localWetness * 0.08, 0.0, 0.64);
           float runnerMask = smoothstep(u_channelThreshold * 0.7, min(1.0, u_channelThreshold * 0.7 + 0.42), runner);
           float runnerSweep = clamp(runner * (0.24 + u_channelScale * 0.12), 0.0, 0.92);
@@ -3767,7 +4236,10 @@ export class WetSurfaceEngine {
       positionLoc: gl.getAttribLocation(program, 'a_position'),
       alphaLoc: gl.getUniformLocation(program, 'u_alpha'),
       texelLoc: gl.getUniformLocation(program, 'u_texel'),
+      gpuFieldsTexelLoc: gl.getUniformLocation(program, 'u_gpuFieldsTexel'),
       baseWetnessLoc: gl.getUniformLocation(program, 'u_baseWetness'),
+      gpuMoistureMaxLoc: gl.getUniformLocation(program, 'u_gpuMoistureMax'),
+      useGpuFieldsLocalDensityLoc: gl.getUniformLocation(program, 'u_useGpuFieldsLocalDensity'),
       fogDensityScaleLoc: gl.getUniformLocation(program, 'u_fogDensityScale'),
       softnessScaleLoc: gl.getUniformLocation(program, 'u_softnessScale'),
       mistTrailScaleLoc: gl.getUniformLocation(program, 'u_mistTrailScale'),
@@ -3809,6 +4281,8 @@ export class WetSurfaceEngine {
     const tintStrength = clamp(this.tuningConfig.fogSurface.fogTintStrength, 0, 0.5)
     const fillBoost = clamp(this.tuningConfig.fogSurface.fogFillBoost, 0, 0.08)
     const useFogCompositing = Boolean(this.tuningConfig.debug?.useGpuFogCompositing)
+    const runtimeMode = this.getRuntimeMode()
+    const isGpuFieldsMode = runtimeMode === 'gpuFields'
     const runtime = this.initGpuOverlayRuntime()
     if (!runtime) {
       return false
@@ -3825,7 +4299,10 @@ export class WetSurfaceEngine {
       positionLoc,
       alphaLoc,
       texelLoc,
+      gpuFieldsTexelLoc,
       baseWetnessLoc,
+      gpuMoistureMaxLoc,
+      useGpuFieldsLocalDensityLoc,
       fogDensityScaleLoc,
       softnessScaleLoc,
       mistTrailScaleLoc,
@@ -3843,14 +4320,23 @@ export class WetSurfaceEngine {
       trailTexLoc,
       runnerTexLoc,
     } = runtime
-    const surfaces = this.surfaceWetnessField.getRenderSurfaces?.()
-    if (!surfaces) {
+    const surfaces = isGpuFieldsMode ? null : this.surfaceWetnessField.getRenderSurfaces?.()
+    if (!isGpuFieldsMode && !surfaces) {
       return false
     }
 
-    const fieldWidth = Math.max(1, surfaces.width | 0)
-    const fieldHeight = Math.max(1, surfaces.height | 0)
+    const gpuFieldWidth = Math.max(1, this.gpuFieldsState?.width | 0)
+    const gpuFieldHeight = Math.max(1, this.gpuFieldsState?.height | 0)
+    const renderFieldWidth = Math.max(1, this.fogCanvas.width | 0)
+    const renderFieldHeight = Math.max(1, this.fogCanvas.height | 0)
+    const fieldWidth = isGpuFieldsMode ? renderFieldWidth : Math.max(1, surfaces.width | 0)
+    const fieldHeight = isGpuFieldsMode ? renderFieldHeight : Math.max(1, surfaces.height | 0)
     const pixelCount = fieldWidth * fieldHeight
+    const gpuMoistureField = isGpuFieldsMode ? this.gpuFieldsState?.moistureField : null
+    if (isGpuFieldsMode && (!gpuMoistureField || gpuMoistureField.length !== gpuFieldWidth * gpuFieldHeight)) {
+      return false
+    }
+
     const fogDensityScale = clamp(
       (0.65 + this.tuningConfig.links.mistDensity * 0.7) * clamp(this.tuningConfig.fogSurface.wetnessFogGain ?? 1, 0, 6),
       0,
@@ -3876,168 +4362,205 @@ export class WetSurfaceEngine {
     const densityClearPersistence = clamp(this.tuningConfig.fogSurface.densityResponsiveClearPersistence ?? 0, 0, 2)
     const debugContrast = clamp(this.tuningConfig.fogSurface.debugSurfaceContrast ?? 1.8, 0.4, 5)
 
-    if (runtime.fieldWidth !== fieldWidth || runtime.fieldHeight !== fieldHeight) {
+    if (runtime.fieldWidth !== fieldWidth || runtime.fieldHeight !== fieldHeight || runtime.isGpuFieldsMode !== isGpuFieldsMode) {
       runtime.fieldWidth = fieldWidth
       runtime.fieldHeight = fieldHeight
+      runtime.isGpuFieldsMode = isGpuFieldsMode
       gl.bindTexture(gl.TEXTURE_2D, wetnessTexture)
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, fieldWidth, fieldHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
-      gl.bindTexture(gl.TEXTURE_2D, trailTexture)
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, fieldWidth, fieldHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
-      gl.bindTexture(gl.TEXTURE_2D, runnerTexture)
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, fieldWidth, fieldHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+      if (isGpuFieldsMode) {
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, gpuFieldWidth, gpuFieldHeight, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, null)
+      } else {
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, fieldWidth, fieldHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+        gl.bindTexture(gl.TEXTURE_2D, trailTexture)
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, fieldWidth, fieldHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+        gl.bindTexture(gl.TEXTURE_2D, runnerTexture)
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, fieldWidth, fieldHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+      }
       runtime.wetnessUploadBuffer = null
       runtime.trailUploadBuffer = null
       runtime.runnerUploadBuffer = null
     }
 
-    if (!runtime.wetnessUploadBuffer || runtime.wetnessUploadBuffer.length !== pixelCount * 4) {
+    if (isGpuFieldsMode) {
+      if (!runtime.wetnessUploadBuffer || runtime.wetnessUploadBuffer.length !== gpuFieldWidth * gpuFieldHeight) {
+        runtime.wetnessUploadBuffer = new Uint8Array(gpuFieldWidth * gpuFieldHeight)
+      }
+    } else if (!runtime.wetnessUploadBuffer || runtime.wetnessUploadBuffer.length !== pixelCount * 4) {
       runtime.wetnessUploadBuffer = new Uint8Array(pixelCount * 4)
     }
-    if (!runtime.trailUploadBuffer || runtime.trailUploadBuffer.length !== pixelCount * 4) {
+    if (!isGpuFieldsMode && (!runtime.trailUploadBuffer || runtime.trailUploadBuffer.length !== pixelCount * 4)) {
       runtime.trailUploadBuffer = new Uint8Array(pixelCount * 4)
     }
-    if (!runtime.runnerUploadBuffer || runtime.runnerUploadBuffer.length !== pixelCount * 4) {
+    if (!isGpuFieldsMode && (!runtime.runnerUploadBuffer || runtime.runnerUploadBuffer.length !== pixelCount * 4)) {
       runtime.runnerUploadBuffer = new Uint8Array(pixelCount * 4)
     }
 
     const wetnessUpload = runtime.wetnessUploadBuffer
     const trailUpload = runtime.trailUploadBuffer
     const runnerUpload = runtime.runnerUploadBuffer
-    const baseWetness = clamp(surfaces.baseWetness, 0, 1)
-    const displayGrid = surfaces.displayGrid
-    const trailGrid = surfaces.trailGrid
-    const runnerGrid = surfaces.runnerMemoryGrid
-
-    let wetnessSum = 0
-    let wetnessSqSum = 0
-    let trailSum = 0
-    let runnerSum = 0
-    let channelCoverageCount = 0
-    let carveCoverageCount = 0
-    let alphaSum = 0
-    let alphaSqSum = 0
-    let alphaMax = 0
-
-    let wetnessPeak = 0
-    let trailPeak = 0
-    let runnerPeak = 0
-
-    for (let i = 0; i < pixelCount; i += 1) {
-      const wetness = clamp(baseWetness + displayGrid[i], 0, 1)
-      const trail = clamp(-trailGrid[i], 0, 1)
-      const runner = clamp(-runnerGrid[i], 0, 1)
-      if (wetness > wetnessPeak) wetnessPeak = wetness
-      if (trail > trailPeak) trailPeak = trail
-      if (runner > runnerPeak) runnerPeak = runner
-      const fogBaseDensity = clamp(
-        wetness * (0.58 + fogDensityScale * 0.22) +
-          wetness * softnessScale * 0.10 +
-          wetness * 0.08,
-        0,
-        1,
-      )
-      const impactClear = clamp(
-        Math.max(0, baseWetness - wetness) * (1.65 + this.tuningConfig.dropletInteraction.headClearStrength * 0.55),
-        0,
-        0.58,
-      )
-      const mistSweep = clamp(trail * (0.18 + mistTrailScale * 0.10) + wetness * 0.08, 0, 0.64)
-      const runnerMask = clamp((runner - channelThreshold * 0.7) / Math.max(0.0001, 1 - channelThreshold * 0.7), 0, 1)
-      const runnerSweep = clamp(runner * (0.24 + channelScale * 0.12), 0, 0.92)
-      const channelMask = clamp(Math.max(runnerSweep, runnerMask * (0.36 + channelScale * 0.52)), 0, 1)
-      const pathOccupancy = clamp(trail * 0.84 + runner * 0.88 + impactClear * 0.62, 0, 1)
-      const waterPresence = clamp(pathOccupancy * 0.86 + impactClear * 0.34, 0, 1)
-      const drySpace = 1 - waterPresence
-      const fogDensity = clamp(fogBaseDensity * (0.45 + drySpace * 0.55), 0, 1)
-      const fogDensityClearBoost = 1 + fogDensity * densityClearGain
-      const fogDensityPersistenceBoost = 1 + fogDensity * densityClearPersistence
-      const mistNibble = clamp((trail * 0.12 + runner * 0.16 + wetness * 0.08) * fogDensityPersistenceBoost, 0, 0.58)
-      const occupancySweep = clamp(
-        pathOccupancy * (0.26 + mistTrailScale * 0.07 + channelScale * 0.05) * fogDensityPersistenceBoost,
-        0,
-        0.92,
-      )
-      const sweepClear = clamp(
-        mistSweep * fogDensityPersistenceBoost +
-          mistNibble +
-          channelMask * 0.34 +
-          occupancySweep +
-          wetness * (0.10 + softnessScale * 0.03),
-        0,
-        0.99,
-      )
-      const localClear = clamp((sweepClear + impactClear * 0.24) * fogDensityClearBoost, 0, 0.995)
-      const occupancyPersistence = clamp(pathOccupancy * (0.32 + mistTrailScale * 0.07 + channelScale * 0.05), 0, 0.98)
-      const wetnessPersistence = clamp((trail * 0.22 + runner * 0.26 + wetness * 0.20) * fogDensityPersistenceBoost, 0, 1)
-      const recoverySuppression = clamp(
-        (occupancyPersistence * 0.64 + wetnessPersistence * 0.56) *
-          (0.22 + fogDensity * 0.78) *
-          densityClearPersistence,
-        0,
-        0.92,
-      )
-      const localRecoveryRate = clamp((1 - recoverySuppression) * (0.25 + drySpace * 0.75), 0, 1)
-      const alpha = clamp(fogDensity * (1 - localClear) * localRecoveryRate * fogAlpha * overlayAlpha, 0, 1)
-
-      wetnessSum += wetness
-      wetnessSqSum += wetness * wetness
-      trailSum += trail
-      runnerSum += runner
-      alphaSum += alpha
-      alphaSqSum += alpha * alpha
-      if (alpha > alphaMax) {
-        alphaMax = alpha
+    const gpuMoistureMax = Math.max(0.0001, Number(this.gpuFieldsState?.options?.maxMoisture) || Number(this.tuningConfig.surfaceWetness.maxWetness) || 0.36)
+    const renderBaseWetness = isGpuFieldsMode ? 0 : clamp(surfaces.baseWetness, 0, 1)
+    const displayGrid = isGpuFieldsMode ? null : surfaces.displayGrid
+    const trailGrid = isGpuFieldsMode ? null : surfaces.trailGrid
+    const runnerGrid = isGpuFieldsMode ? null : surfaces.runnerMemoryGrid
+    if (isGpuFieldsMode) {
+      const gpuRenderMoistureField = this.gpuFieldsState.getRenderStabilizedMoistureField(0.34)
+      const invGpuMoistureMax = 255 / gpuMoistureMax
+      for (let i = 0; i < gpuRenderMoistureField.length; i += 1) {
+        wetnessUpload[i] = Math.round(clamp(gpuRenderMoistureField[i] * invGpuMoistureMax, 0, 255))
       }
-      if (runner > channelThreshold) {
-        channelCoverageCount += 1
+      const gpuStats = this.gpuFieldsState.getStats?.() || null
+      this.timing.rendererSamplingSource = 'gpuFields-shader-sampling'
+      this.timing.rendererWetnessSampleMean = Number(gpuStats?.moistureMean || this.gpuFieldsState.getDisplayMoisture?.() || 0)
+      this.timing.rendererWetnessSampleVariance = 0
+      this.timing.rendererTrailSampleMean = 0
+      this.timing.rendererRunnerSampleMean = 0
+      this.timing.rendererChannelCoverage = 0
+      this.timing.debugWetnessPeak = Number(gpuStats?.moistureMax || 0)
+      this.timing.debugTrailPeak = 0
+      this.timing.debugRunnerPeak = 0
+      this.timing.rendererCarveCoverage = 0
+      this.timing.gpuOverlayFogAlphaMean = 0
+      this.timing.gpuOverlayFogAlphaMax = 0
+      this.timing.gpuFogAlphaMean = 0
+      this.timing.gpuFogAlphaVariance = 0
+    } else {
+      let wetnessSum = 0
+      let wetnessSqSum = 0
+      let trailSum = 0
+      let runnerSum = 0
+      let channelCoverageCount = 0
+      let carveCoverageCount = 0
+      let alphaSum = 0
+      let alphaSqSum = 0
+      let alphaMax = 0
+
+      let wetnessPeak = 0
+      let trailPeak = 0
+      let runnerPeak = 0
+
+      for (let i = 0; i < pixelCount; i += 1) {
+        const wetness = clamp(renderBaseWetness + displayGrid[i], 0, 1)
+        const trail = clamp(-trailGrid[i], 0, 1)
+        const runner = clamp(-runnerGrid[i], 0, 1)
+        if (wetness > wetnessPeak) wetnessPeak = wetness
+        if (trail > trailPeak) trailPeak = trail
+        if (runner > runnerPeak) runnerPeak = runner
+        const fogBaseDensity = clamp(
+          wetness * (0.58 + fogDensityScale * 0.22) +
+            wetness * softnessScale * 0.10 +
+            wetness * 0.08,
+          0,
+          1,
+        )
+        const impactClear = clamp(
+          Math.max(0, renderBaseWetness - wetness) * (1.65 + this.tuningConfig.dropletInteraction.headClearStrength * 0.55),
+          0,
+          0.58,
+        )
+        const mistSweep = clamp(trail * (0.18 + mistTrailScale * 0.10) + wetness * 0.08, 0, 0.64)
+        const runnerMask = clamp((runner - channelThreshold * 0.7) / Math.max(0.0001, 1 - channelThreshold * 0.7), 0, 1)
+        const runnerSweep = clamp(runner * (0.24 + channelScale * 0.12), 0, 0.92)
+        const channelMask = clamp(Math.max(runnerSweep, runnerMask * (0.36 + channelScale * 0.52)), 0, 1)
+        const pathOccupancy = clamp(trail * 0.84 + runner * 0.88 + impactClear * 0.62, 0, 1)
+        const waterPresence = clamp(pathOccupancy * 0.86 + impactClear * 0.34, 0, 1)
+        const drySpace = 1 - waterPresence
+        const fogDensity = clamp(fogBaseDensity * (0.45 + drySpace * 0.55), 0, 1)
+        const fogDensityClearBoost = 1 + fogDensity * densityClearGain
+        const fogDensityPersistenceBoost = 1 + fogDensity * densityClearPersistence
+        const mistNibble = clamp((trail * 0.12 + runner * 0.16 + wetness * 0.08) * fogDensityPersistenceBoost, 0, 0.58)
+        const occupancySweep = clamp(
+          pathOccupancy * (0.26 + mistTrailScale * 0.07 + channelScale * 0.05) * fogDensityPersistenceBoost,
+          0,
+          0.92,
+        )
+        const sweepClear = clamp(
+          mistSweep * fogDensityPersistenceBoost +
+            mistNibble +
+            channelMask * 0.34 +
+            occupancySweep +
+            wetness * (0.10 + softnessScale * 0.03),
+          0,
+          0.99,
+        )
+        const localClear = clamp((sweepClear + impactClear * 0.24) * fogDensityClearBoost, 0, 0.995)
+        const occupancyPersistence = clamp(pathOccupancy * (0.32 + mistTrailScale * 0.07 + channelScale * 0.05), 0, 0.98)
+        const wetnessPersistence = clamp((trail * 0.22 + runner * 0.26 + wetness * 0.20) * fogDensityPersistenceBoost, 0, 1)
+        const recoverySuppression = clamp(
+          (occupancyPersistence * 0.64 + wetnessPersistence * 0.56) *
+            (0.22 + fogDensity * 0.78) *
+            densityClearPersistence,
+          0,
+          0.92,
+        )
+        const localRecoveryRate = clamp((1 - recoverySuppression) * (0.25 + drySpace * 0.75), 0, 1)
+
+        const alpha = clamp(fogDensity * (1 - localClear) * localRecoveryRate * fogAlpha * overlayAlpha, 0, 1)
+
+        wetnessSum += wetness
+        wetnessSqSum += wetness * wetness
+        trailSum += trail
+        runnerSum += runner
+        alphaSum += alpha
+        alphaSqSum += alpha * alpha
+        if (alpha > alphaMax) {
+          alphaMax = alpha
+        }
+        if (runner > channelThreshold) {
+          channelCoverageCount += 1
+        }
+        if (channelMask > 0.12 && fogDensity > 0.1) {
+          carveCoverageCount += 1
+        }
+
+        const pixel = i * 4
+        const wetnessByte = Math.round(wetness * 255)
+        const trailByte = Math.round(trail * 255)
+        const runnerByte = Math.round(runner * 255)
+
+        wetnessUpload[pixel] = wetnessByte
+        wetnessUpload[pixel + 1] = wetnessByte
+        wetnessUpload[pixel + 2] = wetnessByte
+        wetnessUpload[pixel + 3] = 255
+
+        trailUpload[pixel] = trailByte
+        trailUpload[pixel + 1] = trailByte
+        trailUpload[pixel + 2] = trailByte
+        trailUpload[pixel + 3] = 255
+
+        runnerUpload[pixel] = runnerByte
+        runnerUpload[pixel + 1] = runnerByte
+        runnerUpload[pixel + 2] = runnerByte
+        runnerUpload[pixel + 3] = 255
       }
-      if (channelMask > 0.12 && fogDensity > 0.1) {
-        carveCoverageCount += 1
-      }
 
-      const pixel = i * 4
-      const wetnessByte = Math.round(wetness * 255)
-      const trailByte = Math.round(trail * 255)
-      const runnerByte = Math.round(runner * 255)
+      const invPixels = 1 / Math.max(1, pixelCount)
+      const wetnessMean = wetnessSum * invPixels
+      const wetnessVariance = Math.max(0, wetnessSqSum * invPixels - wetnessMean * wetnessMean)
+      const trailMean = trailSum * invPixels
+      const runnerMean = runnerSum * invPixels
+      const alphaMean = alphaSum * invPixels
+      const alphaVariance = Math.max(0, alphaSqSum * invPixels - alphaMean * alphaMean)
 
-      wetnessUpload[pixel] = wetnessByte
-      wetnessUpload[pixel + 1] = wetnessByte
-      wetnessUpload[pixel + 2] = wetnessByte
-      wetnessUpload[pixel + 3] = 255
-
-      trailUpload[pixel] = trailByte
-      trailUpload[pixel + 1] = trailByte
-      trailUpload[pixel + 2] = trailByte
-      trailUpload[pixel + 3] = 255
-
-      runnerUpload[pixel] = runnerByte
-      runnerUpload[pixel + 1] = runnerByte
-      runnerUpload[pixel + 2] = runnerByte
-      runnerUpload[pixel + 3] = 255
+      this.timing.rendererSamplingSource = 'surface-wetness-textures'
+      this.timing.rendererWetnessSampleMean = wetnessMean
+      this.timing.rendererWetnessSampleVariance = wetnessVariance
+      this.timing.rendererTrailSampleMean = trailMean
+      this.timing.rendererRunnerSampleMean = runnerMean
+      this.timing.rendererChannelCoverage = channelCoverageCount * invPixels
+      this.timing.debugWetnessPeak = wetnessPeak
+      this.timing.debugTrailPeak = trailPeak
+      this.timing.debugRunnerPeak = runnerPeak
+      this.timing.rendererCarveCoverage = carveCoverageCount * invPixels
+      this.timing.gpuOverlayFogAlphaMean = alphaMean
+      this.timing.gpuOverlayFogAlphaMax = alphaMax
+      this.timing.gpuFogAlphaMean = alphaMean
+      this.timing.gpuFogAlphaVariance = alphaVariance
     }
-
-    const invPixels = 1 / Math.max(1, pixelCount)
-    const wetnessMean = wetnessSum * invPixels
-    const wetnessVariance = Math.max(0, wetnessSqSum * invPixels - wetnessMean * wetnessMean)
-    const trailMean = trailSum * invPixels
-    const runnerMean = runnerSum * invPixels
-    const alphaMean = alphaSum * invPixels
-    const alphaVariance = Math.max(0, alphaSqSum * invPixels - alphaMean * alphaMean)
-
-    this.timing.rendererSamplingSource = 'surface-wetness-textures'
-    this.timing.rendererWetnessSampleMean = wetnessMean
-    this.timing.rendererWetnessSampleVariance = wetnessVariance
-    this.timing.rendererTrailSampleMean = trailMean
-    this.timing.rendererRunnerSampleMean = runnerMean
-    this.timing.rendererChannelCoverage = channelCoverageCount * invPixels
-    this.timing.debugWetnessPeak = wetnessPeak
-    this.timing.debugTrailPeak = trailPeak
-    this.timing.debugRunnerPeak = runnerPeak
-    this.timing.rendererCarveCoverage = carveCoverageCount * invPixels
-    this.timing.gpuOverlayFogAlphaMean = alphaMean
-    this.timing.gpuOverlayFogAlphaMax = alphaMax
-    this.timing.gpuFogAlphaMean = alphaMean
-    this.timing.gpuFogAlphaVariance = alphaVariance
 
     if (canvas.width !== this.width || canvas.height !== this.height) {
       canvas.width = this.width
@@ -4055,22 +4578,31 @@ export class WetSurfaceEngine {
 
     gl.activeTexture(gl.TEXTURE0)
     gl.bindTexture(gl.TEXTURE_2D, wetnessTexture)
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, fieldWidth, fieldHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, wetnessUpload)
+    if (isGpuFieldsMode) {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, gpuFieldWidth, gpuFieldHeight, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, wetnessUpload)
+    } else {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, fieldWidth, fieldHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, wetnessUpload)
+    }
     gl.uniform1i(wetnessTexLoc, 0)
 
-    gl.activeTexture(gl.TEXTURE1)
-    gl.bindTexture(gl.TEXTURE_2D, trailTexture)
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, fieldWidth, fieldHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, trailUpload)
-    gl.uniform1i(trailTexLoc, 1)
+    if (!isGpuFieldsMode) {
+      gl.activeTexture(gl.TEXTURE1)
+      gl.bindTexture(gl.TEXTURE_2D, trailTexture)
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, fieldWidth, fieldHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, trailUpload)
+      gl.uniform1i(trailTexLoc, 1)
 
-    gl.activeTexture(gl.TEXTURE2)
-    gl.bindTexture(gl.TEXTURE_2D, runnerTexture)
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, fieldWidth, fieldHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, runnerUpload)
-    gl.uniform1i(runnerTexLoc, 2)
+      gl.activeTexture(gl.TEXTURE2)
+      gl.bindTexture(gl.TEXTURE_2D, runnerTexture)
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, fieldWidth, fieldHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, runnerUpload)
+      gl.uniform1i(runnerTexLoc, 2)
+    }
 
     gl.uniform2f(texelLoc, 1 / Math.max(1, fieldWidth), 1 / Math.max(1, fieldHeight))
+    gl.uniform2f(gpuFieldsTexelLoc, 1 / Math.max(1, gpuFieldWidth), 1 / Math.max(1, gpuFieldHeight))
     gl.uniform1f(alphaLoc, fogAlpha * overlayAlpha)
-    gl.uniform1f(baseWetnessLoc, baseWetness)
+    gl.uniform1f(baseWetnessLoc, renderBaseWetness)
+    gl.uniform1f(gpuMoistureMaxLoc, gpuMoistureMax)
+    gl.uniform1f(useGpuFieldsLocalDensityLoc, isGpuFieldsMode ? 1 : 0)
     gl.uniform1f(fogDensityScaleLoc, fogDensityScale)
     gl.uniform1f(softnessScaleLoc, softnessScale)
     gl.uniform1f(mistTrailScaleLoc, mistTrailScale)
@@ -4736,7 +5268,7 @@ export class WetSurfaceEngine {
     this.ctx.strokeRect(x - 8, y - 28, insetWidth + 16, insetHeight + 36)
 
     if (this.raindropRenderer?.canvas) {
-      this.ctx.drawImage(this.raindropRenderer.canvas, x, y, insetWidth, insetHeight)
+      this.drawRendererCanvasToPresentation(this.raindropRenderer.canvas, x, y, insetWidth, insetHeight)
       this.ctx.strokeStyle = 'rgba(255, 180, 0, 0.95)'
       this.ctx.strokeRect(x, y, insetWidth, insetHeight)
     }
@@ -4775,7 +5307,7 @@ export class WetSurfaceEngine {
     const rendererCanvas = rendererCompositeSource?.canvas || this.raindropRenderer?.canvas || null
     if (this.raindropRendererReady && rendererCanvas) {
       this.renderCompositeDebug.rawRendererCanvasDrawExecuted = true
-      this.ctx.drawImage(rendererCanvas, 0, 0, this.width, this.height)
+      this.drawRendererCanvasToPresentation(rendererCanvas, 0, 0, this.width, this.height)
     }
   }
 
@@ -4798,7 +5330,14 @@ export class WetSurfaceEngine {
 
     const drawGpuComposite = () => {
       this.drawNativeRawFrame()
-      const rendered = this.drawSurfaceGpuRuntime()
+      let rendered = false
+      if (this.getRuntimeMode() === 'gpuFields') {
+        const renderStart = performance.now()
+        rendered = this.drawSurfaceGpuRuntime()
+        this.timing.renderTimeMs += performance.now() - renderStart
+      } else {
+        rendered = this.drawSurfaceGpuRuntime()
+      }
       if (!rendered) {
         this.drawSurfaceCpu()
       }
@@ -4917,6 +5456,18 @@ export class WetSurfaceEngine {
     const frameDeltaMs = this.lastFrameTimestamp > 0 ? now - this.lastFrameTimestamp : 16.7
     this.lastFrameTimestamp = now
     this.lastTime = now
+    this.timing.frameDeltaMs = frameDeltaMs
+    this.timing.totalFrameTimeMs = frameDeltaMs
+    this.timing.simulationTimeMs = 0
+    this.timing.renderTimeMs = 0
+    this.timing.raindropFxUpdateTimeMs = 0
+    this.timing.adapterDrawTimeMs = 0
+    this.timing.surfaceCompositeTimeMs = 0
+    this.resetSurfaceCompositeTimingDetails()
+    this.timing.presentationCompositeTimeMs = 0
+    this.timing.overlayCanvasDrawTimeMs = 0
+    this.timing.overlayCanvasDirect2dDrawTimeMs = 0
+    this.timing.debugOverlayCompositeTimeMs = 0
 
     let rendererMs = 0
     let wetnessMs = 0
@@ -4952,7 +5503,14 @@ export class WetSurfaceEngine {
     )
     const fullRefresh =
       baseDrift >= this.baseWetnessSyncThreshold || this.wetnessFrameCounter % fullRefreshIntervalFrames === 0
-    this.surfaceWetnessField.addCondensation(dt, { fullField: fullRefresh })
+    
+    const runtimeMode = this.getRuntimeMode()
+    this.timing.runtimeMode = runtimeMode
+    if (runtimeMode === 'legacy') {
+      this.surfaceWetnessField.addCondensation(dt, { fullField: fullRefresh })
+    } else if (runtimeMode === 'gpuFields') {
+      this.updateWetnessViaGpuFields(dt, { fullField: fullRefresh })
+    }
     if (this.wetnessFrameCounter <= 1) {
       this.recordWetnessLifecycleTrace('frame-post-condensation', {
         frameIndex: Number(this.wetnessFrameCounter || 0),
@@ -4991,8 +5549,10 @@ export class WetSurfaceEngine {
 
     if (useSimulationTrailEvents && Array.isArray(simulationTrailEvents)) {
       const trailStarted = performance.now()
-      const toFogX = this.fogCanvas.width / Math.max(1, this.width)
-      const toFogY = this.fogCanvas.height / Math.max(1, this.height)
+      const rendererSurfaceWidth = Math.max(1, this.rendererInternalWidth || this.width)
+      const rendererSurfaceHeight = Math.max(1, this.rendererInternalHeight || this.height)
+      const toFogX = this.fogCanvas.width / rendererSurfaceWidth
+      const toFogY = this.fogCanvas.height / rendererSurfaceHeight
       const trailPositionDrops = []
       const seededPreviousState = new Map()
       let processedTrailEventCount = 0
@@ -5128,13 +5688,25 @@ export class WetSurfaceEngine {
     const smoothPasses = Math.max(1, Math.round(this.tuningConfig.fogSurface.smoothingPassCount))
     const smoothingStride = Math.max(1, Math.round(this.tuningConfig.debug?.wetnessSmoothingStride ?? 1))
     const regionOnlySmoothing = this.tuningConfig.debug?.wetnessRegionOnlySmoothing !== false
-    this.surfaceWetnessField.smooth(dt, smoothPasses, {
-      stride: smoothingStride,
-      regionOnly: regionOnlySmoothing,
-    })
-    this.finalizeRunnerCarvePostSmooth()
-    const imageResult = this.syncFogCanvasFromWetnessField({ fullRefresh })
-    this.finalizeRunnerCarveFogCoupling()
+    
+    // Gate legacy CPU surface smoothing in gpuFields mode (allow only for diagnostics)
+    const isGpuFieldsMode = runtimeMode === 'gpuFields'
+    const allowLegacySurfaceSmoothingForDiagnostics = this.tuningConfig.debug?.gpuFieldsAllowLegacySurfaceSmoothingForDiagnostics === true
+    if (!isGpuFieldsMode || allowLegacySurfaceSmoothingForDiagnostics) {
+      this.surfaceWetnessField.smooth(dt, smoothPasses, {
+        stride: smoothingStride,
+        regionOnly: regionOnlySmoothing,
+      })
+      this.finalizeRunnerCarvePostSmooth()
+    }
+    
+    // Gate legacy fogCanvas synchronization in gpuFields mode (allow only for diagnostics)
+    const allowLegacyFogCanvasSyncForDiagnostics = this.tuningConfig.debug?.gpuFieldsAllowLegacyFogCanvasSyncForDiagnostics === true
+    let imageResult = null
+    if (!isGpuFieldsMode || allowLegacyFogCanvasSyncForDiagnostics) {
+      imageResult = this.syncFogCanvasFromWetnessField({ fullRefresh })
+      this.finalizeRunnerCarveFogCoupling()
+    }
     // Diagnostics-only packet marker for deterministic capture alignment.
     this.timing.runnerCarveDiagnosticsPacketId = this.wetnessFrameCounter
     this.timing.wetnessFrameCounter = this.wetnessFrameCounter
@@ -5149,14 +5721,22 @@ export class WetSurfaceEngine {
       compatibilityMode = 'cpu-compat'
     }
     this.timing.interactionBackend = wantsGpuWritingInteraction ? 'gpu-write-queue' : 'cpu-direct'
-    if (wantsGpuWetnessSimulation) {
+    
+    // Gate optional GPU scaffold pass in gpuFields mode (allow only for diagnostics/comparison)
+    const allowGpuScaffoldForDiagnostics = this.tuningConfig.debug?.gpuFieldsAllowGpuScaffoldPassForDiagnostics === true
+    const shouldRunGpuScaffold = !isGpuFieldsMode || allowGpuScaffoldForDiagnostics
+    if (wantsGpuWetnessSimulation && shouldRunGpuScaffold) {
       const gpuPassOk = this.runGpuWetnessSimulationScaffoldPass(dt)
       this.timing.wetnessBackend = gpuPassOk ? 'gpu-sim' : 'cpu-grid-fallback'
       if (!gpuPassOk) {
         compatibilityMode = 'cpu-fallback'
         this.timing.gpuSimKernel = 'off'
       }
-    } else {
+    } else if (!shouldRunGpuScaffold && wantsGpuWetnessSimulation) {
+      // In gpuFields mode without diagnostic flag, skip GPU scaffold but maintain timing state
+      this.timing.gpuSimKernel = 'off'
+    } else if (!wantsGpuWetnessSimulation) {
+      // GPU simulation disabled: clear interaction queues and state
       this.gpuInteractionWriteQueue.length = 0
       this.timing.gpuInteractionWritesQueued = 0
       this.timing.gpuInteractionWritesConsumed = 0
@@ -5188,42 +5768,99 @@ export class WetSurfaceEngine {
     wetnessMs = performance.now() - wetnessStart
     this.wetnessFrameCounter += 1
 
+    if (runtimeMode === 'gpuFields') {
+      this.timing.simulationTimeMs = performance.now() - frameStart
+    }
+    this.timing.raindropFxUpdateTimeMs = rendererMs
+
     const overlayStart = performance.now()
-    this.ctx.setTransform(window.devicePixelRatio || 1, 0, 0, window.devicePixelRatio || 1, 0, 0)
-    this.ctx.globalAlpha = 1
-    this.ctx.globalCompositeOperation = 'source-over'
-    this.ctx.beginPath()
-    this.ctx.clearRect(0, 0, this.width, this.height)
     const viewMode = this.tuningConfig.debug.viewMode
     const splitCompareActive = viewMode === 'split-compare' || this.tuningConfig.debug.splitCompareEnabled
     const overlayBackendCompareActive = Boolean(this.tuningConfig.debug.overlayBackendCompareEnabled)
+    const useGpuFieldsRendererDomPresentation = runtimeMode === 'gpuFields'
+    this.syncGpuFieldsDirectToScreenPresentation(useGpuFieldsRendererDomPresentation)
+    this.updateGpuFieldsPresentationTiming(runtimeMode)
+
+    const overlaySignature = useGpuFieldsRendererDomPresentation
+      ? this.buildGpuFieldsOverlaySignature({ viewMode })
+      : ''
+    const debugOverlayActive = this.rendererDebugEnabled || this.tuningConfig.debug.showRawRendererInset
+    const overlaySignatureChanged = overlaySignature !== this.gpuFieldsOverlayLastSignature
+    const shouldRedrawGpuFieldsOverlay =
+      useGpuFieldsRendererDomPresentation &&
+      (overlaySignatureChanged || !this.gpuFieldsOverlayHasContent || debugOverlayActive)
+
+    if (!useGpuFieldsRendererDomPresentation || shouldRedrawGpuFieldsOverlay) {
+      this.ctx.globalAlpha = 1
+      this.ctx.globalCompositeOperation = 'source-over'
+      this.ctx.beginPath()
+      this.ctx.clearRect(0, 0, this.width, this.height)
+    }
     this.renderCompositeDebug = {
       backgroundDrawExecuted: false,
       sceneMatteDrawn: false,
       rawRendererCanvasDrawExecuted: false,
       rawFramePathUsed: false,
-      drawBranch: overlayBackendCompareActive
-        ? 'overlay-backend-compare'
-        : splitCompareActive
-          ? 'split-compare'
-          : 'combined',
+      drawBranch: useGpuFieldsRendererDomPresentation
+        ? 'combined-gpufields-overlay-only'
+        : overlayBackendCompareActive
+          ? 'overlay-backend-compare'
+          : splitCompareActive
+            ? 'split-compare'
+            : 'combined',
       backgroundSource: 'none',
     }
 
     if (overlayBackendCompareActive) {
       this.timing.overlayBackend = 'cpu-gpu-compare'
+      const presentationCompositeStart = performance.now()
       this.drawOverlayBackendCompareView()
+      this.timing.presentationCompositeTimeMs += performance.now() - presentationCompositeStart
     } else if (splitCompareActive) {
+      const presentationCompositeStart = performance.now()
       this.drawSplitCompareView()
+      this.timing.presentationCompositeTimeMs += performance.now() - presentationCompositeStart
     } else {
       if (viewMode !== 'fog-only') {
-        this.drawBackground()
+        if (useGpuFieldsRendererDomPresentation) {
+          this.renderCompositeDebug.rawFramePathUsed = true
+          this.renderCompositeDebug.rawRendererCanvasDrawExecuted = false
+          this.renderCompositeDebug.backgroundSource = 'raindropRenderer.canvas-dom'
+        } else {
+          const presentationCompositeStart = performance.now()
+          this.drawBackground()
+          this.timing.presentationCompositeTimeMs += performance.now() - presentationCompositeStart
+        }
       }
-      if (viewMode !== 'renderer-only' && !this.rendererOnlyDebug) {
+      if (
+        viewMode !== 'renderer-only' &&
+        !this.rendererOnlyDebug &&
+        (!useGpuFieldsRendererDomPresentation || shouldRedrawGpuFieldsOverlay)
+      ) {
+        const surfaceCompositeStart = performance.now()
         this.drawSurface()
+        const surfaceCompositeDuration = performance.now() - surfaceCompositeStart
+        this.timing.surfaceCompositeTimeMs += surfaceCompositeDuration
+        this.timing.overlayCanvasDirect2dDrawTimeMs += surfaceCompositeDuration
       }
     }
-    this.drawRendererDebugOverlay()
+
+    const shouldDrawDebugOverlay =
+      !useGpuFieldsRendererDomPresentation || shouldRedrawGpuFieldsOverlay
+    if (shouldDrawDebugOverlay) {
+      const debugOverlayStart = performance.now()
+      this.drawRendererDebugOverlay()
+      const debugOverlayDuration = performance.now() - debugOverlayStart
+      this.timing.debugOverlayCompositeTimeMs += debugOverlayDuration
+      this.timing.overlayCanvasDirect2dDrawTimeMs += debugOverlayDuration
+    }
+
+    if (useGpuFieldsRendererDomPresentation) {
+      this.gpuFieldsOverlayLastSignature = overlaySignature
+      this.gpuFieldsOverlayHasContent = viewMode !== 'renderer-only' || debugOverlayActive
+    }
+
+    this.timing.overlayCanvasDrawTimeMs = this.timing.overlayCanvasDirect2dDrawTimeMs
 
     if (this.tuningConfig.debug.freezeBackground && !this.backgroundFrozen) {
       this.captureBackgroundFrame()
@@ -5233,6 +5870,15 @@ export class WetSurfaceEngine {
 
     const engineMs = performance.now() - frameStart
     this.timing.avgFrameMs = this.timing.avgFrameMs > 0 ? this.timing.avgFrameMs * 0.92 + frameDeltaMs * 0.08 : frameDeltaMs
+    this.timing.fpsWindowMs = (this.timing.fpsWindowMs || 0) + frameDeltaMs
+    this.timing.fpsWindowFrames = (this.timing.fpsWindowFrames || 0) + 1
+    if (this.timing.fpsWindowMs >= 500) {
+      this.timing.fps = this.timing.fpsWindowMs > 0
+        ? (this.timing.fpsWindowFrames * 1000) / this.timing.fpsWindowMs
+        : 0
+      this.timing.fpsWindowMs = 0
+      this.timing.fpsWindowFrames = 0
+    }
     this.timing.engineMs = this.timing.engineMs > 0 ? this.timing.engineMs * 0.85 + engineMs * 0.15 : engineMs
     this.timing.rendererMs = this.timing.rendererMs > 0 ? this.timing.rendererMs * 0.85 + rendererMs * 0.15 : rendererMs
     this.timing.wetnessMs = this.timing.wetnessMs > 0 ? this.timing.wetnessMs * 0.85 + wetnessMs * 0.15 : wetnessMs
@@ -5281,6 +5927,58 @@ export class WetSurfaceEngine {
     }
 
     const rendererState = this.raindropRenderer?.getDebugState?.() ?? null
+    const renderedSimulatorRaindropCount = Number(
+      rendererState?.simulatorRaindropCount ?? this.timing.simulatedDropletCount ?? 0,
+    )
+    this.stabilityReadoutSamples.push({
+      atMs: now,
+      fps: Number(this.timing.fps || 0),
+      renderedSimulatorRaindropCount,
+      raindropFxUpdateTimeMs: Number(this.timing.raindropFxUpdateTimeMs || 0),
+    })
+    const stabilityCutoffMs = now - this.stabilityReadoutWindowMs
+    while (
+      this.stabilityReadoutSamples.length > 0
+      && Number(this.stabilityReadoutSamples[0]?.atMs || 0) < stabilityCutoffMs
+    ) {
+      this.stabilityReadoutSamples.shift()
+    }
+
+    if (runtimeMode === 'gpuFields' && this.stabilityReadoutSamples.length > 0) {
+      let fpsMin = Number(this.stabilityReadoutSamples[0]?.fps || 0)
+      let fpsMax = fpsMin
+      let countMin = Number(this.stabilityReadoutSamples[0]?.renderedSimulatorRaindropCount || 0)
+      let countMax = countMin
+      let raindropFxUpdateTimeMsMin = Number(this.stabilityReadoutSamples[0]?.raindropFxUpdateTimeMs || 0)
+      let raindropFxUpdateTimeMsMax = raindropFxUpdateTimeMsMin
+      for (let index = 1; index < this.stabilityReadoutSamples.length; index += 1) {
+        const sample = this.stabilityReadoutSamples[index]
+        const sampleFps = Number(sample?.fps || 0)
+        const sampleCount = Number(sample?.renderedSimulatorRaindropCount || 0)
+        const sampleRaindropFxUpdateTimeMs = Number(sample?.raindropFxUpdateTimeMs || 0)
+        if (sampleFps < fpsMin) fpsMin = sampleFps
+        if (sampleFps > fpsMax) fpsMax = sampleFps
+        if (sampleCount < countMin) countMin = sampleCount
+        if (sampleCount > countMax) countMax = sampleCount
+        if (sampleRaindropFxUpdateTimeMs < raindropFxUpdateTimeMsMin) raindropFxUpdateTimeMsMin = sampleRaindropFxUpdateTimeMs
+        if (sampleRaindropFxUpdateTimeMs > raindropFxUpdateTimeMsMax) raindropFxUpdateTimeMsMax = sampleRaindropFxUpdateTimeMs
+      }
+      this.timing.fpsRollingMin5s = fpsMin
+      this.timing.fpsRollingMax5s = fpsMax
+      this.timing.renderedSimulatorRaindropCountRollingMin5s = countMin
+      this.timing.renderedSimulatorRaindropCountRollingMax5s = countMax
+      this.timing.raindropFxUpdateTimeMsRollingMin5s = raindropFxUpdateTimeMsMin
+      this.timing.raindropFxUpdateTimeMsRollingMax5s = raindropFxUpdateTimeMsMax
+    } else {
+      this.timing.fpsRollingMin5s = 0
+      this.timing.fpsRollingMax5s = 0
+      this.timing.renderedSimulatorRaindropCountRollingMin5s = 0
+      this.timing.renderedSimulatorRaindropCountRollingMax5s = 0
+      this.timing.raindropFxUpdateTimeMsRollingMin5s = 0
+      this.timing.raindropFxUpdateTimeMsRollingMax5s = 0
+    }
+    this.timing.gpuFieldsRendererCanvasDomMountActive =
+      runtimeMode === 'gpuFields' && this.timing.rendererCanvasDomMountActive === true
 
     this.onStats?.({
       fog: this.fogLevel,
@@ -5317,6 +6015,35 @@ export class WetSurfaceEngine {
       },
       timing: {
         avgFrameMs: this.timing.avgFrameMs,
+        frameDeltaMs: this.timing.frameDeltaMs,
+        totalFrameTimeMs: this.timing.totalFrameTimeMs,
+        simulationTimeMs: this.timing.simulationTimeMs,
+        renderTimeMs: this.timing.renderTimeMs,
+        raindropFxUpdateTimeMs: this.timing.raindropFxUpdateTimeMs,
+        adapterDrawTimeMs: this.timing.adapterDrawTimeMs,
+        surfaceCompositeTimeMs: this.timing.surfaceCompositeTimeMs,
+        surfaceCompositeTimeMsDetailed: {
+          ...(this.timing.surfaceCompositeTimeMsDetailed || {}),
+        },
+        presentationCompositeTimeMs: this.timing.presentationCompositeTimeMs,
+        overlayCanvasDrawTimeMs: this.timing.overlayCanvasDrawTimeMs,
+        overlayCanvasDirect2dDrawTimeMs: this.timing.overlayCanvasDirect2dDrawTimeMs,
+        debugOverlayCompositeTimeMs: this.timing.debugOverlayCompositeTimeMs,
+        rendererCanvasDomMountActive: this.timing.rendererCanvasDomMountActive,
+        rendererCanvasCssScale: this.timing.rendererCanvasCssScale,
+        rendererCanvasClientSize: this.timing.rendererCanvasClientSize,
+        rendererCanvasBackingSize: this.timing.rendererCanvasBackingSize,
+        overlayCanvasClientSize: this.timing.overlayCanvasClientSize,
+        overlayCanvasBackingSize: this.timing.overlayCanvasBackingSize,
+        runtimeMode: this.timing.runtimeMode,
+        fps: this.timing.fps,
+        fpsRollingMin5s: this.timing.fpsRollingMin5s,
+        fpsRollingMax5s: this.timing.fpsRollingMax5s,
+        renderedSimulatorRaindropCountRollingMin5s: this.timing.renderedSimulatorRaindropCountRollingMin5s,
+        renderedSimulatorRaindropCountRollingMax5s: this.timing.renderedSimulatorRaindropCountRollingMax5s,
+        raindropFxUpdateTimeMsRollingMin5s: this.timing.raindropFxUpdateTimeMsRollingMin5s,
+        raindropFxUpdateTimeMsRollingMax5s: this.timing.raindropFxUpdateTimeMsRollingMax5s,
+        gpuFieldsRendererCanvasDomMountActive: this.timing.gpuFieldsRendererCanvasDomMountActive,
         engineMs: this.timing.engineMs,
         rendererMs: this.timing.rendererMs,
         wetnessMs: this.timing.wetnessMs,
@@ -5409,6 +6136,12 @@ export class WetSurfaceEngine {
         wetnessTrendMsPerMin,
         wetnessResolutionPixels: this.fogCanvas.width * this.fogCanvas.height,
         wetnessResolutionLabel: `${this.fogCanvas.width}x${this.fogCanvas.height}`,
+        renderDisplayWidth: this.timing.renderDisplayWidth,
+        renderDisplayHeight: this.timing.renderDisplayHeight,
+        renderInternalScale: this.timing.renderInternalScale,
+        renderInternalWidth: this.timing.renderInternalWidth,
+        renderInternalHeight: this.timing.renderInternalHeight,
+        renderInternalResolutionLabel: this.timing.renderInternalResolutionLabel,
         activeRegionPixels: fieldStats?.activeRegionPixels || 0,
         activeRegionRect: fieldStats?.activeRegionRect || null,
         recoveryPixels: fieldStats?.recoveryPixels || 0,
@@ -5507,6 +6240,24 @@ export class WetSurfaceEngine {
     const drawX = (this.width - drawWidth) / 2
     const drawY = (this.height - drawHeight) / 2
     this.backgroundFreezeCtx.drawImage(img, drawX, drawY, drawWidth, drawHeight)
+  }
+
+  resolveRendererInternalSize(displayWidth, displayHeight) {
+    const width = Math.max(1, Math.floor(displayWidth || this.width || 1))
+    const height = Math.max(1, Math.floor(displayHeight || this.height || 1))
+    const runtimeMode = this.getRuntimeMode()
+    if (runtimeMode !== 'gpuFields') {
+      return { width, height, scale: 1 }
+    }
+
+    const scale = this.presentationInternalRenderScale
+    const internalWidth = Math.max(1, Math.floor(width * scale))
+    const internalHeight = Math.max(1, Math.floor(height * scale))
+    return {
+      width: internalWidth,
+      height: internalHeight,
+      scale,
+    }
   }
 
   getCanvasSnapshotDataUrl() {

@@ -782,9 +782,10 @@ function App() {
           </div>
 
           {hudCollapsed ? (
-            <p className="line">Frame {(timingStats.avgFrameMs || 0).toFixed(2)}ms | Fog {Math.round(hudStats.fog * 100)}%</p>
+            <p className="line">Frame {(timingStats.avgFrameMs || 0).toFixed(2)}ms | FPS {Math.round(timingStats.fps || 0)} | Fog {Math.round(hudStats.fog * 100)}%</p>
           ) : (
             <>
+              <p className="line">FPS: {(timingStats.fps || 0).toFixed(1)}</p>
               <p className="line">Phase: {PHASES.find((item) => item.id === phase)?.label}</p>
               <p className="line">Fog: {Math.round(hudStats.fog * 100)}%</p>
               <p className="line">Droplets: {hudStats.droplets}</p>

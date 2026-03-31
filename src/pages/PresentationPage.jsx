@@ -47,6 +47,7 @@ const PRESENTATION_RUNTIME_SESSION_STORAGE_KEY = 'mistyos.presentation.lastRunti
 // a Presentation-side contract-violation path, but the marker string remains
 // intentionally preserved for the existing proof surface.
 const PRESENTATION_CONTRACT_VIOLATION_SENTINEL = 'active-rain-with-zero-droplets'
+const PRESENTATION_INTERNAL_RENDER_SCALE = 0.67
 
 function getNavigationType() {
   if (typeof window === 'undefined' || typeof performance === 'undefined') {
@@ -280,10 +281,12 @@ function PresentationPage() {
     const ctx = canvas.getContext('2d')
     ctx?.clearRect(0, 0, canvas.width, canvas.height)
 
+    const presentationTuningConfig = getLinkedEffectiveConfig(basePreset)
     const engine = new WetSurfaceEngine(canvas, {
       backgroundSrc: background.src,
       phase: 3,
-      tuningConfig: getLinkedEffectiveConfig(basePreset),
+      tuningConfig: presentationTuningConfig,
+      presentationInternalRenderScale: PRESENTATION_INTERNAL_RENDER_SCALE,
       onStats: (stats) => {
         setPresentationStats(stats)
       },
@@ -746,59 +749,36 @@ function PresentationPage() {
       </button>
 
       {import.meta.env.DEV ? (
-        <div className="presentation-runtime-meta" aria-live="polite">
-          <div>{publishedMetaLabel}</div>
-          <div>publishRevision: {publishRevision}</div>
-          <div>fromSavedRevision: {fromSavedRevision}</div>
-          <div>restartToken: {restartToken}</div>
-          <div>sceneId: {sceneMetaId}</div>
-          <div>timelineId: {timelineMetaId}</div>
-          <div>runtimeTimelineId: {runtimeTimelineResolvedId}</div>
-          <div>runtimePayloadHash: {runtimePayloadHash}</div>
-          <div>timeline: {timelineMetaLabel}</div>
-          <div>verificationScenario: {verificationScenarioName}</div>
-          <div>verificationPassFail: {verificationPassFail}</div>
-          <div>verificationPublishRevision: {verificationPublishRevision}</div>
-          <div>verificationRestartToken: {verificationRestartToken}</div>
-          <div>runnerCarveMode: {presentationTiming.runnerCarveLastMode || 'none'}</div>
-          <div>runnerCarveInterpolationActive: {presentationTiming.runnerCarveInterpolationActive ? 'yes' : 'no'}</div>
-          <div>runnerCarvePrevMatchSource: {presentationTiming.runnerCarveLastPreviousMatchSource || 'none'}</div>
-          <div>runnerCarveProximityMatches: {presentationTiming.runnerCarveInterpolationProximityMatches || 0}</div>
-          <div>runnerCarvePrevPos: ({(presentationTiming.runnerCarveLastPrevX || 0).toFixed(1)}, {(presentationTiming.runnerCarveLastPrevY || 0).toFixed(1)})</div>
-          <div>runnerCarveCurrPos: ({(presentationTiming.runnerCarveLastCurrX || 0).toFixed(1)}, {(presentationTiming.runnerCarveLastCurrY || 0).toFixed(1)})</div>
-          <div>runnerCarveSegmentLength: {(presentationTiming.runnerCarveLastSegmentLength || 0).toFixed(2)}</div>
-          <div>runnerCarveDepositionRadius: {(presentationTiming.runnerCarveLastRadius || 0).toFixed(2)}</div>
-          <div>runnerCarveSpacingRatioMean: {(presentationTiming.runnerCarveSpacingRatioMean || 0).toFixed(2)}</div>
-          <div>runnerCarveGapFraction: {(((presentationTiming.runnerCarveGapFraction || 0) * 100)).toFixed(1)}%</div>
-          <div>runnerCarveDepthGainMean: {(presentationTiming.runnerCarveDepthGainMean || 0).toFixed(4)}</div>
-          <div>runnerCarvePostSmoothRetentionMean: {(presentationTiming.runnerCarvePostSmoothRetentionMean || 0).toFixed(2)}</div>
-          <div>runnerCarveRecoveryRatioMean: {(presentationTiming.runnerCarveRecoveryRatioMean || 0).toFixed(2)}</div>
-          <div>clockMode: {clockDebug.mode}</div>
-          <div>clockLastAction: {clockDebug.lastAction}</div>
-          <div>clockTargetSec: {(clockDebug.targetSec || 0).toFixed(2)}</div>
-          <div>currentTimeSec: {(presentationTiming.simulationClockCurrentTimeSec || 0).toFixed(2)}</div>
-          <div>loopTimeSec: {(presentationTiming.simulationClockLoopTimeSec || 0).toFixed(2)}</div>
-          <div>durationSec: {runtimeDurationSec.toFixed(2)}</div>
-          <div>appliedSampleSec: {(presentationTiming.runtimeAppliedSampleSec || 0).toFixed(2)}</div>
-          <div>rainIntensity: {(presentationTiming.runtimeSampledRainIntensity || 0).toFixed(3)}</div>
-          <div>activeRainClipCount: {activeRainClipIds.length}</div>
-          <div>activeRainClipIds: {activeRainClipIds.length ? activeRainClipIds.join(', ') : 'none'}</div>
-          <div>rainContribution: {activeRainContribution.toFixed(3)}</div>
-          <div>effectiveRefillRate: {(presentationTiming.runtimeEffectiveRefillRate || 0).toFixed(4)}</div>
-          <div>drivenDropletsPerSeconds: {Math.round(presentationTiming.runtimeDrivenDropletsPerSeconds || 0)}</div>
-          <div>render.simulatorRaindropCount: {Number(presentationRenderer.simulatorRaindropCount || 0)}</div>
-          <div>render.renderSucceeded: {presentationRenderer.renderSucceeded ? 'true' : 'false'}</div>
-          <div>bootstrap.rendererCreated: {presentationBootstrap.rendererCreated ? 'true' : 'false'}</div>
-          <div>bootstrap.rendererAttached: {presentationBootstrap.rendererAttached ? 'true' : 'false'}</div>
-          <div>bootstrap.initialWeatherApplied: {presentationBootstrap.initialWeatherApplied ? 'true' : 'false'}</div>
-          <div>bootstrap.initialRainApplied: {presentationBootstrap.initialRainApplied ? 'true' : 'false'}</div>
-          <div>bootstrap.initialFogApplied: {presentationBootstrap.initialFogApplied ? 'true' : 'false'}</div>
-          <div>bootstrap.seededDropletCount: {Number(presentationBootstrap.seededDropletCount || 0)}</div>
-          <div>bootstrap.firstVisibleRainFrame: {Number.isFinite(presentationBootstrap.firstVisibleRainFrame) ? presentationBootstrap.firstVisibleRainFrame : -1}</div>
-          <div>bootstrap.firstRenderFrameTime: {(Number(presentationBootstrap.firstRenderFrameTime || 0)).toFixed(2)}</div>
-          <div>bootstrap.refreshPath: {presentationBootstrap.refreshPath ? 'true' : 'false'}</div>
-          <div>bootstrap.publishRestartPath: {presentationBootstrap.publishRestartPath ? 'true' : 'false'}</div>
-            <div>bootstrap.adapterInitDropletsPerSeconds: {Number(presentationBootstrap.adapterInitDropletsPerSeconds || 0)}</div>
+        <div
+          className="presentation-runtime-meta"
+          aria-live="polite"
+          style={{ maxWidth: 540, maxHeight: '45vh', overflow: 'auto' }}
+        >
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(2, minmax(180px, 1fr))',
+              gap: '2px 10px',
+              fontSize: '11px',
+              lineHeight: 1.2,
+            }}
+          >
+            <div>fps: {Number(presentationTiming.fps || presentationStats?.fps || 0).toFixed(1)}</div>
+            <div>dt: {Number(presentationTiming.frameDeltaMs || 0).toFixed(2)}</div>
+            <div>frame: {Number(presentationTiming.totalFrameTimeMs || presentationTiming.frameDeltaMs || 0).toFixed(2)}</div>
+            <div>sim: {Number(presentationTiming.simulationTimeMs || 0).toFixed(2)}</div>
+            <div>adapter: {Number(presentationTiming.adapterDrawTimeMs || 0).toFixed(2)}</div>
+            <div>present: {Number(presentationTiming.presentationCompositeTimeMs || 0).toFixed(2)}</div>
+            <div>rBack: {presentationTiming.rendererCanvasBackingSize || 'n/a'}</div>
+            <div>rScale: {Number(presentationTiming.rendererCanvasCssScale || 1).toFixed(3)}</div>
+            <div>rMount: {presentationTiming.rendererCanvasDomMountActive ? 'true' : 'false'}</div>
+            <div>fps5sMin: {Number(presentationTiming.fpsRollingMin5s || 0).toFixed(1)}</div>
+            <div>fps5sMax: {Number(presentationTiming.fpsRollingMax5s || 0).toFixed(1)}</div>
+            <div>drop5sMin: {Math.round(presentationTiming.renderedSimulatorRaindropCountRollingMin5s || 0)}</div>
+            <div>drop5sMax: {Math.round(presentationTiming.renderedSimulatorRaindropCountRollingMax5s || 0)}</div>
+            <div>rdfx5sMin: {Number(presentationTiming.raindropFxUpdateTimeMsRollingMin5s || 0).toFixed(2)}</div>
+            <div>rdfx5sMax: {Number(presentationTiming.raindropFxUpdateTimeMsRollingMax5s || 0).toFixed(2)}</div>
+          </div>
           <div className="presentation-runtime-controls">
             <button type="button" onClick={handleResetTimeToZero}>Reset Time 0.0</button>
             <button type="button" onClick={handleSeekFirstRainWindow}>Seek First Rain Window</button>
