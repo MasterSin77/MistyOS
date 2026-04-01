@@ -43,6 +43,7 @@ No-copy presentation baseline details:
 
 Recent stabilization outcomes reflected in current code and docs:
 
+- Stage 1 Studio UI and authoring stabilization is complete.
 - No-copy presentation baseline path is active for `gpuFields` runtime mode.
 - Adapter timing instrumentation is split (`raindropFxUpdateTimeMs`, `adapterSimulationTimeMs`, `adapterGlStateResetTimeMs`, `adapterRendererDrawTimeMs`) to separate simulation and draw/reset costs.
 - Cross-tab contention was surfaced and handled through runtime-surface ownership controls and preview pause semantics.
@@ -143,6 +144,8 @@ High-level map:
 
 ## Current Priorities
 
+- Continue timeline and preview architecture hardening for the two-surface workflow.
+- Advance deterministic weather authoring so Save and Update Desktop produce reproducible runtime handoff outcomes.
 - Continue RaindropFX behavior parity validation against baseline-seed flows.
 - Advance wetness-driven fog coupling without breaking deterministic lifecycle contracts.
 - Preserve performance while keeping authoritative-field architecture and single-active-surface behavior intact.
